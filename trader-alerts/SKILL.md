@@ -148,6 +148,14 @@ watched; with `add --opening-bell`, the bell rings at 9:30.
 It never places, cancels or changes an order, never claims a quote is
 live, and never predicts where a price is going.
 
+## India (NSE), the default in this fork
+
+With `"market": "in"`: `alerts.py clock` is the NSE clock (India time, 9:15 to
+15:30, NSE holidays: on 2026-11-10 it says closed, Diwali Balipratipada, next
+open 2026-11-11 09:15); the opening bell rings at 9:15; `add --from-plan`
+sets the flat-by alert at 15:10; quotes come from Yahoo's SYMBOL.NS and print
+in rupees. Stooq is US only: use `--source yahoo`.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

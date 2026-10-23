@@ -191,6 +191,25 @@ oversold bounce).
 It never places, sizes or checks an order, never says which stock to buy,
 never calls data real time, and never promises that a setup works.
 
+## India (NSE), the default in this fork
+
+With `"market": "in"` (trader/config.json, or `--market in`):
+
+- `scan.py universe` reads NSE's own files: EQUITY_L.csv (every listed
+  equity) and fo_mktlots.csv (the F&O stocks) or the Nifty 200 list from
+  niftyindices.com. It keeps series EQ only (BE and BZ are trade-to-trade:
+  delivery only, no intraday) and, by default, the F&O stocks (`--list fo`,
+  213 on 2026-10-23); `--list nifty200` or `--list all` widen it. `--offline
+  DIR` reads the same file names from a folder.
+- Symbols stay NSE's (RELIANCE, M&M, BAJAJ-AUTO); Yahoo reads them as
+  RELIANCE.NS.
+- Times are India time. The opening range is 9:15 to 9:30, so `orb` runs
+  after 9:35; no new entries after 14:45. NSE holidays for 2026.
+- Floors: `--min-price 20` (rupees) and no share-volume floor on the daily
+  scan, because the F&O list is already the liquid names.
+- Yahoo's 9:15 bar often shows zero volume (the opening auction is counted
+  elsewhere): keep that in mind with volume filters.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

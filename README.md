@@ -16,6 +16,48 @@ past day the same setup fired, and tells you the honest odds.
 And no trade goes through until you say yes. Nothing in this pack can place
 an order on its own. Paper trading is the default.
 
+## This fork: India (NSE), Phase 0
+
+This branch points the pack at the Indian stock market. Every skill reads
+`"market"` from `trader/config.json` (or `--market`): `"in"` is the default
+here, `"us"` keeps the original NYSE behaviour, and the original tests still
+run on it. What `"in"` changes:
+
+| piece | NSE (`"in"`) | NYSE (`"us"`) |
+| --- | --- | --- |
+| clock | India time, UTC+5:30 all year | New York, with daylight saving |
+| session | 9:15 to 15:30; opening range 9:15 to 9:30 | 9:30 to 16:00 |
+| entries, flat by | 9:30 to 14:45, flat by 15:10 | 9:45 to 15:30, flat by 15:55 |
+| holidays | NSE 2026 list (past dates checked against Nifty's real trading days) | NYSE 2026 and 2027 |
+| universe | `scan.py universe`: NSE's EQUITY_L.csv, series EQ only (trade-to-trade BE/BZ out), within the F&O stock list (`--list fo`, about 213 names) or the Nifty 200 (`--list nifty200`) | Nasdaq Trader lists |
+| symbols | RELIANCE, M&M, BAJAJ-AUTO; Yahoo reads them as `SYMBOL.NS` | TSLA, BRK.B |
+| time machine | a full session is the 72 bars from 9:15 to 15:15 (F&O stocks then go into the closing auction, which leaves no 5-minute bars) | 78 bars |
+| money | rupees (`Rs`) | dollars |
+| charges | brokerage (0.03% or Rs 20 an order), STT 0.025% on the sell, NSE 0.00307%, SEBI Rs 10 a crore, stamp 0.003% on the buy, 18% GST: part of the max loss, the daily loss and reward:risk | none |
+| broker | `"broker": "manual"`: you place the order yourself; Claude places nothing | Alpaca or IBKR |
+
+`trader-budget/config.example.json` is the India config (Rs 5,00,000, Rs 2,500
+max loss a trade, Rs 7,500 a day, reward:risk 1.5 after charges, the charge
+rates under `"costs"`); the US one is `config.us.example.json`. The `*_usd`
+keys hold rupees on NSE.
+
+The India reel, Monday 2026-10-19, real RELIANCE bars
+(`tests/fixtures/trader-india`): range 1,207.30 to 1,223.40; the 9:45 bar
+closed at 1,227.80 at 9:50 AM IST; stop 1,215.35 (the midpoint), target
+1,252.70 (2R), flat by 15:10. The Time Machine on 55 real sessions: target
+first 0.6 %, stop first 17.3 %, "Strongly toward the stop". Sized on Rs
+5,00,000: 162 shares (the 40 % position cap binds), Rs 2,016.90 at the stop
+plus Rs 117.19 of charges, reward:risk 1.83 after charges: trader-risk passes
+it, and the ticket says you place it yourself.
+
+Not done yet (Phase 1): an Indian broker connection (Kite Connect or another
+broker's API on a whitelisted static IP, under SEBI's 2026 retail algo rules),
+real-time data instead of Yahoo, NSE corporate announcements for
+`/trader-news` (Yahoo's headline feed matches `.NS` tickers loosely),
+fundamentals from NSE/BSE filings for `/trader-analyst` (SEC only today),
+price-band and surveillance-list checks, and the 2027 NSE holidays (NSE
+publishes them in December). `/trader-pelosi` stays US-only.
+
 > **Looking for the original Trader skill?** Copy an investor's 13F, the
 > stock screener, tax lots and rebalancing live in
 > [github.com/Jakeschincariol/trader-skill](https://github.com/Jakeschincariol/trader-skill).

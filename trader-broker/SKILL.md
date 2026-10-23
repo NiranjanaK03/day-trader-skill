@@ -191,6 +191,22 @@ card reads "Claude wants to use Place stock order" with that JSON and two
 buttons: Allow once, Deny. Allow once sends it to the paper account. The
 `why` and the plan stay in the file; they are never sent.
 
+## India (NSE), the default in this fork
+
+Phase 0 has no Indian broker connection. The India config sets `"broker":
+"manual"`: `ticket.py show` renders the ticket in rupees, says "no broker
+connected (you place it)", and prints no place_stock_order call. The three
+gates still hold: trader-risk's PASS, then the user's typed yes, recorded by
+`ticket.py approve`. After the yes the user enters the order in their own
+broker's app or on paper: the entry, then the stop-loss as an SL order and the
+target as a limit order (most Indian brokers have no bracket order), and
+records what filled with `ticket.py result` and `ticket.py fill`. The logged
+max loss includes the charges (`max_loss_with_charges`), so the daily limit
+counts them. Zerodha's official Kite MCP is read-only apart from GTT orders;
+a live connection (Kite Connect or another broker's API, a whitelisted static
+IP and a daily 2FA login under SEBI's retail algo rules from 1 April 2026) is
+Phase 1.
+
 ## What it never does
 
 - Never places an order without all three gates, and never two orders on one yes.

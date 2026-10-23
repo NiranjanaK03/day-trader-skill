@@ -154,6 +154,33 @@ It never places, approves or schedules an order, never raises a limit on its
 own, never shrinks a stop to fit more shares, and never sizes options,
 margin or short positions.
 
+## India (NSE), the default in this fork
+
+`config.example.json` here is the India config (`"market": "in"`): Rs
+5,00,000 budget, 10 % cash buffer, 40 % position cap, Rs 2,500 max loss a
+trade, Rs 7,500 a day, 3 trades, reward:risk 1.5 after charges, entries 9:30
+to 14:45, flat by 15:10, `"broker": "manual"`. The `*_usd` keys hold rupees.
+The US config is `config.us.example.json`. Ask the user for each value in
+rupees, as in Step 1.
+
+On NSE the round trip's charges are part of the risk. `"costs"` holds the
+rates (Zerodha's published intraday rates by default: brokerage 0.03 % or Rs
+20 an order, STT 0.025 % on the sell, NSE 0.00307 %, SEBI Rs 10 a crore,
+stamp 0.003 % on the buy, GST 18 % on brokerage, exchange and SEBI charges);
+put your own broker's there. Then:
+
+- the max-loss limit is the most shares whose loss at the stop PLUS the
+  charges fits the max loss (Rs 1,000 at a Rs 10 risk is 91 shares, not 100);
+- `min_reward_risk` is judged after charges: the reward at the target minus
+  its charges, over the loss at the stop plus its charges;
+- the order's plan carries `max_loss_with_charges`, which trader-risk and the
+  broker log count against the daily loss.
+
+Worked example: entry 1,250, stop 1,240, target 1,268 on the India config:
+160 shares (the position cap binds), Rs 117.70 of charges if the stop fills,
+Rs 1,717.70 max loss with charges, reward:risk 1.61 after charges. The same
+plan with a 1,265 target (1.5R before charges) is 1.33 after charges: refused.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

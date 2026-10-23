@@ -120,6 +120,16 @@ sizes it: a $50 max loss per trade buys floor(50 / 5.86) = 8 shares.
 It never places an order, never sizes a position, never widens a stop to
 make a plan pass, and never calls a stop a guarantee.
 
+## India (NSE), the default in this fork
+
+With `"market": "in"`: flat by 15:10 India time (ahead of the 15:15 stop of
+continuous trading in F&O stocks for the closing auction, and of brokers'
+intraday auto-square-off); NSE has no early closes. Prices in rupees. The plan
+records `"market": "in"` so the Time Machine and the Budget Manager use the
+same market. The India reel: entry 1,227.80, stop 1,215.35 (the midpoint of
+1,207.30 and 1,223.40), 2R target 1,252.70. Charges are counted later, by
+trader-budget and trader-risk: a 1R target rarely clears them.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

@@ -132,6 +132,16 @@ is `/trader-exit`), never moves the level after the fact, and never counts a
 bar that has not closed. It never runs `/trader-broker` from a background
 watch: nobody is there to say yes.
 
+## India (NSE), the default in this fork
+
+With `"market": "in"`: India time, a 9:15 to 15:30 session, so the 15-minute
+opening range is the 9:15, 9:20 and 9:25 bars; no entries before 9:30 or after
+14:45; NSE holidays. Prices print in rupees (Rs). `entry.py check RELIANCE`
+reads Yahoo's RELIANCE.NS chart. The India reel: RELIANCE on Monday
+2026-10-19, range 1,207.30 to 1,223.40, triggered at 9:50 AM at 1,227.80
+(`tests/fixtures/trader-india/RELIANCE-5d5m.json`). Yahoo's 9:15 bar often
+shows zero volume, so `--min-volume-x` is stricter than it looks on NSE.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

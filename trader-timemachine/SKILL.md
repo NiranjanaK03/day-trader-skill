@@ -156,6 +156,18 @@ and never calls a result a sure thing. It never prints a P&L or a profit.
 It never uses a bar that has not closed yet, and never mixes today's bars
 into the pool.
 
+## India (NSE), the default in this fork
+
+With `"market": "in"` (from trader/plan.json, the config or `--market`): a
+full session is the 72 five-minute bars from 9:15 to 15:15 India time. F&O
+stocks stop continuous trading at 15:15 for the closing auction, and Yahoo
+leaves those last bars empty, so a 9:15-to-15:30 rule would find almost no
+full sessions. `--until` defaults to 15:15; use `--until 15:10`, the flat-by
+time. The India reel (RELIANCE, 2026-10-19, 55 real sessions, seed 19):
+target first 0.6 %, stop first 17.3 %, neither 82.1 %; history 26 fired, 9
+target, 11 stop; "Strongly toward the stop". The replays do not include
+charges: trader-budget adds them.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

@@ -85,6 +85,7 @@ TYPES = {"market", "limit", "stop", "stop_limit", "trailing_stop"}
 TIFS = {"day", "gtc", "opg", "cls", "ioc", "fok"}
 OCC = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
 TICKER = re.compile(r"^[A-Z]{1,5}([.\-][A-Z]{1,2})?$")
+NSE_TICKER = re.compile(r"^[A-Z0-9][A-Z0-9&-]{0,19}$")   # RELIANCE, M&M, BAJAJ-AUTO, 360ONE
 HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 CENT = 0.005
 FRESH_MINUTES = 15
@@ -118,17 +119,97 @@ NYSE_EARLY_CLOSE = {  # 1:00 p.m. ET
     "2026-12-24": "Christmas Eve",
     "2027-11-26": "day after Thanksgiving",
 }
-CALENDAR_YEARS = (2026, 2027)
-OPEN = datetime.time(9, 30)
-CLOSE = datetime.time(16, 0)
 EARLY = datetime.time(13, 0)
+NSE_HOLIDAYS = {  # weekday closures, NSE equity segment; past dates checked against Nifty's trading days
+    "2026-01-26": "Republic Day",
+    "2026-03-03": "Holi",
+    "2026-03-26": "Shri Ram Navami",
+    "2026-03-31": "Shri Mahavir Jayanti",
+    "2026-04-03": "Good Friday",
+    "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2026-05-01": "Maharashtra Day",
+    "2026-05-28": "Bakri Id",
+    "2026-06-26": "Muharram",
+    "2026-09-14": "Ganesh Chaturthi",
+    "2026-10-02": "Mahatma Gandhi Jayanti",
+    "2026-10-20": "Dussehra",
+    "2026-11-10": "Diwali Balipratipada",
+    "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
+    "2026-12-25": "Christmas",
+}
+# Muhurat trading (Sunday 2026-11-08) is a one-hour special session: treated as closed.
+MARKETS = {
+    "in": {"exchange": "NSE", "place": "India", "site": "nseindia.com", "currency": "Rs ", "offset": 5.5,
+           "open": datetime.time(9, 15), "close": datetime.time(15, 30), "holidays": NSE_HOLIDAYS,
+           "early_close": {}, "years": (2026,), "ticker": NSE_TICKER, "charges": True,
+           "no_entries_before": "09:30", "no_entries_after": "14:45", "flat_by": "15:10"},
+    "us": {"exchange": "NYSE", "place": "New York", "site": "nyse.com", "currency": "$", "offset": None,
+           "open": datetime.time(9, 30), "close": datetime.time(16, 0), "holidays": NYSE_HOLIDAYS,
+           "early_close": NYSE_EARLY_CLOSE, "years": (2026, 2027), "ticker": TICKER, "charges": False,
+           "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55"},
+}
+MARKET = "in"   # this fork checks NSE orders, in rupees, after charges; "us" keeps the original behaviour
+# NSE intraday equity charges, from Zerodha's published rates (zerodha.com/charges, read 2026-10-23);
+# the same table and arithmetic as trader-budget/size.py. "costs" in the config overrides any key.
+COSTS_NSE = {
+    "brokerage_pct": 0.03,     # per executed order, 0.03% of its value...
+    "brokerage_max": 20.0,     # ...or Rs 20, whichever is lower
+    "stt_sell_pct": 0.025,     # securities transaction tax, intraday: sell side only
+    "exchange_pct": 0.00307,   # NSE transaction charge, both sides
+    "sebi_per_crore": 10.0,    # SEBI turnover fee, Rs 10 a crore, both sides
+    "stamp_buy_pct": 0.003,    # stamp duty, intraday: buy side only
+    "gst_pct": 18.0,           # GST on brokerage + exchange + SEBI charges
+}
 
 
 class RiskError(Exception):
     pass
 
 
-# ---------------------------------------------------------------- time (New York, no tz files)
+def set_market(name):
+    """Point the clock, the calendar, the ticker rule, the currency, the default
+    window and the charges at one market: "in" (NSE) or "us" (NYSE)."""
+    global MARKET, OPEN, CLOSE, HOLIDAYS, EARLY_CLOSE, CALENDAR_YEARS, EXCHANGE, PLACE, SITE, CUR, SYMBOL_RULE
+    if name not in MARKETS:
+        raise RiskError('market is "in" (NSE) or "us" (NYSE), not %r' % (name,))
+    m = MARKETS[name]
+    MARKET, OPEN, CLOSE, HOLIDAYS, EARLY_CLOSE, CALENDAR_YEARS = (
+        name, m["open"], m["close"], m["holidays"], m["early_close"], m["years"])
+    EXCHANGE, PLACE, SITE, CUR, SYMBOL_RULE = m["exchange"], m["place"], m["site"], m["currency"], m["ticker"]
+    for k in ("no_entries_before", "no_entries_after", "flat_by"):
+        DEFAULTS[k] = m[k]
+
+
+set_market(MARKET)
+
+
+def config_market(path):
+    """The "market" in trader/config.json, or None."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return (json.load(fh) or {}).get("market")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def intraday_charges(qty, buy, sell, rates=None):
+    """Rupee charges for buying qty shares at `buy` and selling them at `sell` the
+    same day on NSE: {brokerage, stt, exchange, sebi, stamp, gst, total}, to the paisa."""
+    r = dict(COSTS_NSE, **(rates or {}))
+    bv, sv = qty * float(buy), qty * float(sell)
+    brokerage = sum(min(v * r["brokerage_pct"] / 100.0, r["brokerage_max"]) for v in (bv, sv) if v > 0)
+    stt = sv * r["stt_sell_pct"] / 100.0
+    exchange = (bv + sv) * r["exchange_pct"] / 100.0
+    sebi = (bv + sv) * r["sebi_per_crore"] / 1e7
+    stamp = bv * r["stamp_buy_pct"] / 100.0
+    gst = (brokerage + exchange + sebi) * r["gst_pct"] / 100.0
+    out = {k: round(v, 2) for k, v in (("brokerage", brokerage), ("stt", stt), ("exchange", exchange),
+                                         ("sebi", sebi), ("stamp", stamp), ("gst", gst))}
+    out["total"] = round(brokerage + stt + exchange + sebi + stamp + gst, 2)
+    return out
+
+
+# ---------------------------------------------------------------- time (market time, no tz files)
 
 def _nth_sunday(year, month, n):
     d = datetime.date(year, month, 1)
@@ -136,10 +217,13 @@ def _nth_sunday(year, month, n):
     return d + datetime.timedelta(weeks=n - 1)
 
 
-def eastern_offset(utc):
-    """Hours from UTC for New York: -4 in daylight time, -5 otherwise.
-    DST runs from 2:00 a.m. on the second Sunday of March to 2:00 a.m. on the
-    first Sunday of November (US rule since 2007)."""
+def local_offset(utc):
+    """Hours from UTC for the market's clock. India: +5.5 all year, no daylight
+    saving. New York: -4 in daylight time, -5 otherwise; DST runs from 2:00 a.m.
+    on the second Sunday of March to 2:00 a.m. on the first Sunday of November
+    (US rule since 2007)."""
+    if MARKETS[MARKET]["offset"] is not None:
+        return MARKETS[MARKET]["offset"]
     y = utc.year
     start = datetime.datetime.combine(_nth_sunday(y, 3, 2), datetime.time(7, 0))   # 2:00 EST
     end = datetime.datetime.combine(_nth_sunday(y, 11, 1), datetime.time(6, 0))    # 2:00 EDT
@@ -147,29 +231,35 @@ def eastern_offset(utc):
     return -4 if start <= naive < end else -5
 
 
-def to_eastern(utc):
-    return utc.replace(tzinfo=None) + datetime.timedelta(hours=eastern_offset(utc))
+def to_local(utc):
+    return utc.replace(tzinfo=None) + datetime.timedelta(hours=local_offset(utc))
 
 
-def eastern_to_utc(local):
+def local_to_utc(local):
+    fixed = MARKETS[MARKET]["offset"]
+    if fixed is not None:
+        return local - datetime.timedelta(hours=fixed)
     for off in (-4, -5):
         utc = local - datetime.timedelta(hours=off)
-        if eastern_offset(utc) == off:
+        if local_offset(utc) == off:
             return utc
     return local + datetime.timedelta(hours=5)
 
 
+eastern_offset, to_eastern, eastern_to_utc = local_offset, to_local, local_to_utc   # the upstream names
+
+
 def parse_now(text):
-    """ISO time -> naive UTC. A time without an offset is taken as New York time."""
+    """ISO time -> naive UTC. A time without an offset is taken as market time (IST or New York)."""
     if not text:
         return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
     t = text.strip().replace("Z", "+00:00")
     try:
         dt = datetime.datetime.fromisoformat(t)
     except ValueError:
-        raise RiskError("--now wants a time like \"2026-10-19 10:15\" (New York) or ...Z (UTC)")
+        raise RiskError("--now wants a time like \"2026-10-19 10:15\" (%s) or ...Z (UTC)" % PLACE)
     if dt.tzinfo is None:
-        return eastern_to_utc(dt)
+        return local_to_utc(dt)
     return (dt - dt.utcoffset()).replace(tzinfo=None)
 
 
@@ -186,12 +276,12 @@ def parse_utc(text):
 
 
 def trading_day(d):
-    """(is_trading_day, reason). Weekends and the NYSE holiday list."""
+    """(is_trading_day, reason). Weekends and the market's holiday list."""
     if d.weekday() >= 5:
         return False, "weekend"
-    name = NYSE_HOLIDAYS.get(d.isoformat())
+    name = HOLIDAYS.get(d.isoformat())
     if name:
-        return False, "NYSE holiday: " + name
+        return False, "%s holiday: %s" % (EXCHANGE, name)
     return True, ""
 
 
@@ -201,7 +291,7 @@ def hhmm(value, key):
         return None
     m = HHMM.match(str(value).strip())
     if not m:
-        raise RiskError("%s must be a New York time like \"09:45\", got %r" % (key, value))
+        raise RiskError("%s must be a %s time like \"%s\", got %r" % (key, PLACE, DEFAULTS["no_entries_before"], value))
     return datetime.time(int(m.group(1)), int(m.group(2)))
 
 
@@ -211,7 +301,7 @@ def _shift(t, hours):
 
 
 def window_check(now_et, c):
-    """Reasons an entry cannot be placed now (New York time). Empty when the window is off."""
+    """Reasons an entry cannot be placed now (market time). Empty when the window is off."""
     before = hhmm(c.get("no_entries_before"), "no_entries_before")
     after = hhmm(c.get("no_entries_after"), "no_entries_after")
     if before is None and after is None:
@@ -219,26 +309,26 @@ def window_check(now_et, c):
     warns = []
     d, t = now_et.date(), now_et.time().replace(second=0, microsecond=0)
     if d.year not in CALENDAR_YEARS:
-        warns.append("the holiday list covers %s only: check nyse.com for %s"
-                     % (" and ".join(map(str, CALENDAR_YEARS)), d.isoformat()))
+        warns.append("the holiday list covers %s only: check %s for %s"
+                     % (" and ".join(map(str, CALENDAR_YEARS)), SITE, d.isoformat()))
     ok, why = trading_day(d)
     stamp = now_et.strftime("%a %Y-%m-%d %H:%M")
     if not ok:
-        return ["window: the market is closed today (%s, %s New York)" % (why, stamp)], warns
-    close = EARLY if d.isoformat() in NYSE_EARLY_CLOSE else CLOSE
+        return ["window: the market is closed today (%s, %s %s)" % (why, stamp, PLACE)], warns
+    close = EARLY if d.isoformat() in EARLY_CLOSE else CLOSE
     if t < OPEN or now_et.time() >= close:
-        return ["window: the market is closed (%s New York; the session is %s to %s)"
-                % (stamp, OPEN.strftime("%H:%M"), close.strftime("%H:%M"))], warns
+        return ["window: the market is closed (%s %s; the session is %s to %s)"
+                % (stamp, PLACE, OPEN.strftime("%H:%M"), close.strftime("%H:%M"))], warns
     if close == EARLY and after is not None:
         after = _shift(after, 3)
         warns.append("early close at 1:00 p.m. today (%s): no new entries after %s"
-                     % (NYSE_EARLY_CLOSE[d.isoformat()], after.strftime("%H:%M")))
+                     % (EARLY_CLOSE[d.isoformat()], after.strftime("%H:%M")))
     if before is not None and t < before:
-        return ["window: no new entries before %s New York (it is %s)" % (before.strftime("%H:%M"),
-                                                                          t.strftime("%H:%M"))], warns
+        return ["window: no new entries before %s %s (it is %s)" % (before.strftime("%H:%M"), PLACE,
+                                                                    t.strftime("%H:%M"))], warns
     if after is not None and t > after:
-        return ["window: no new entries after %s New York (it is %s)" % (after.strftime("%H:%M"),
-                                                                         t.strftime("%H:%M"))], warns
+        return ["window: no new entries after %s %s (it is %s)" % (after.strftime("%H:%M"), PLACE,
+                                                                   t.strftime("%H:%M"))], warns
     return [], warns
 
 
@@ -283,7 +373,7 @@ def _f(x):
 
 
 def money(x):
-    return "$" + "{:,.2f}".format(float(x)).replace(".00", "")
+    return CUR + "{:,.2f}".format(float(x)).replace(".00", "")
 
 
 def _cent(x):
@@ -379,7 +469,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     c.update(cfg or {})
     prices = {str(k).upper(): float(v) for k, v in (prices or {}).items() if _f(v)}
     now_utc = now or parse_now(None)
-    now_et = to_eastern(now_utc)
+    now_et = to_local(now_utc)
     today = today or now_et.date().isoformat()
     acct, top_warn = account(c, portfolio, prices)
     blocked = {str(b).upper() for b in c.get("blocked") or []}
@@ -479,9 +569,9 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                                "(\"allow_options\": false)" % sym)
             else:
                 warns.append("option order: options can lose 100%% of what you pay")
-        elif sym and ("/" in sym or not TICKER.match(sym)):
-            reasons.append("asset: %s does not look like a US stock or ETF ticker; "
-                           "this pack trades stocks and ETFs only" % sym)
+        elif sym and ("/" in sym or not SYMBOL_RULE.match(sym)):
+            reasons.append("asset: %s does not look like %s stock or ETF ticker; "
+                           "this pack trades stocks and ETFs only" % (sym, "an NSE" if MARKET == "in" else "a US"))
 
         # the reference price: what one share costs to get in
         plan_entry = _f(plan.get("entry"))
@@ -595,15 +685,37 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     risk_ps = risk_c / 100.0
                     shares = q if q is not None else ((value or 0) / ref)
                     max_loss = round(shares * risk_ps, 2)
+                    fees_stop = fees_target = None
+                    if MARKETS[MARKET]["charges"]:
+                        # on NSE the round trip's charges are part of what a trade can lose
+                        rates = c.get("costs")
+                        fees_stop = intraday_charges(shares, *((ref, stop) if long else (stop, ref)), rates=rates)
+                        price_loss, max_loss = max_loss, round(max_loss + fees_stop["total"], 2)
                     cap = _f(c.get("max_loss_per_trade_usd"))
                     if cap and max_loss > cap + CENT:
-                        later.append("loss: %s shares x %s risk a share = %s at the stop, over your %s max loss "
-                                     "per trade" % (_num(shares), _p(risk_ps), money(max_loss), money(cap)))
+                        if fees_stop:
+                            later.append("loss: %s shares x %s risk a share = %s at the stop, plus %s charges = %s, "
+                                         "over your %s max loss per trade" % (
+                                             _num(shares), _p(risk_ps), money(price_loss), money(fees_stop["total"]),
+                                             money(max_loss), money(cap)))
+                        else:
+                            later.append("loss: %s shares x %s risk a share = %s at the stop, over your %s max loss "
+                                         "per trade" % (_num(shares), _p(risk_ps), money(max_loss), money(cap)))
                     min_rr = _f(c.get("min_reward_risk"))
                     if target:
                         if (long and target <= ref + CENT) or (not long and target >= ref - CENT):
                             later.append("target: the target %s must be %s the entry %s"
                                          % (_p(target), "above" if long else "below", _p(ref)))
+                        elif fees_stop:
+                            fees_target = intraday_charges(shares, *((ref, target) if long else (target, ref)),
+                                                           rates=c.get("costs"))
+                            reward = shares * abs(target - ref) - fees_target["total"]
+                            rr = round(reward / max_loss, 2)
+                            if min_rr and rr < min_rr - 1e-9:
+                                later.append("reward:risk: %.2f after charges (%s at the target minus %s charges, "
+                                             "against %s) is under your minimum %s" % (
+                                                 rr, money(shares * abs(target - ref)), money(fees_target["total"]),
+                                                 money(max_loss), _num(min_rr)))
                         else:
                             rr = round(int(round(abs(target - ref) * 100)) / float(risk_c), 2)
                             if min_rr and rr < min_rr - 1e-9:
@@ -632,10 +744,11 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 info.append("entry %s (%s), stop %s, target %s: risk %s a share"
                             % (_p(ref), REF_WORDS.get(ref_from, ref_from), _p(stop),
                                _p(target) if target else "none", _p(risk_ps)))
-                info.append("max loss %s%s, reward:risk %s%s"
-                            % (money(max_loss), (" (limit %s)" % money(c["max_loss_per_trade_usd"]))
+                info.append("max loss %s%s%s, reward:risk %s%s%s"
+                            % (money(max_loss), " with %s charges" % money(fees_stop["total"]) if fees_stop else "",
+                               (" (limit %s)" % money(c["max_loss_per_trade_usd"]))
                                if _f(c.get("max_loss_per_trade_usd")) else "",
-                               ("%.2f" % rr) if rr is not None else "n/a",
+                               ("%.2f" % rr) if rr is not None else "n/a", " after charges" if fees_stop else "",
                                (" (min %s)" % _num(c["min_reward_risk"])) if _f(c.get("min_reward_risk")) else ""))
             if daily or cap_t:
                 info.append("today before this: %d of %s trades, %s of %s daily loss"
@@ -731,8 +844,8 @@ def report(res):
         for x in r["warnings"]:
             lines.append("        ~ " + x)
     lines.append("")
-    lines.append("%d passed, %d blocked at %s New York. Cash after the passed orders: %s (%s account)."
-                 % (res["pass"], res["block"], res["now_new_york"], money(res["cash_after"]),
+    lines.append("%d passed, %d blocked at %s %s. Cash after the passed orders: %s (%s account)."
+                 % (res["pass"], res["block"], res["now_new_york"], PLACE, money(res["cash_after"]),
                     "paper" if res["paper"] else "LIVE"))
     if res["block"]:
         lines.append("Blocked orders do not go to the broker. Fix the order or your rules, then check again.")
@@ -773,13 +886,16 @@ def main(argv=None):
                     help="your account; if missing, a fresh account funded with the budget")
     ap.add_argument("--prices", default="trader/prices.json")
     ap.add_argument("--state", default="trader/state/broker.json", help="what trader-broker placed today")
-    ap.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\"")
-    ap.add_argument("--today", help="YYYY-MM-DD (default: today in New York)")
+    ap.add_argument("--now", help="pretend it is this market time, e.g. \"2026-10-19 10:15\"")
+    ap.add_argument("--today", help="YYYY-MM-DD (default: today in market time)")
+    ap.add_argument("--market", choices=sorted(MARKETS), help='"in" NSE (default: rupees, Indian charges) or '
+                    '"us" NYSE; else config "market"')
     ap.add_argument("--out", default="trader/state/risk.json", help="where the verdicts are recorded")
     ap.add_argument("--no-write", action="store_true", help="do not record the verdicts")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     try:
+        set_market(a.market or config_market(a.config) or MARKET)
         now = parse_now(a.now)
         if a.today and not re.match(r"^\d{4}-\d{2}-\d{2}$", a.today):
             raise RiskError("--today wants a date like 2026-10-19")

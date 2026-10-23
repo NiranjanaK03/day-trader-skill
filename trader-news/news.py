@@ -49,6 +49,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -100,8 +101,30 @@ def _nth_sunday(year, month, n):
     return d + _dt.timedelta(weeks=n - 1)
 
 
-def eastern_offset(utc):
-    """Hours from UTC for New York: -4 in daylight time, -5 otherwise (US rule since 2007)."""
+MARKETS = {
+    "in": {"zone": "IST", "offset": 5.5, "region": "IN", "lang": "en-IN", "sec": False},
+    "us": {"zone": "ET", "offset": None, "region": "US", "lang": "en-US", "sec": True},
+}
+MARKET = "in"   # this fork reads NSE tickers on India time; "us" keeps the original behaviour
+
+
+def set_market(name):
+    """Point the clock, Yahoo's symbols and feed region, and SEC filings at one market:
+    "in" (NSE, India time, no SEC) or "us" (NYSE, New York time, SEC 8-Ks)."""
+    global MARKET, ZONE
+    if name not in MARKETS:
+        raise ValueError('market is "in" (NSE) or "us" (NYSE), not %r' % (name,))
+    MARKET, ZONE = name, MARKETS[name]["zone"]
+
+
+set_market(MARKET)
+
+
+def local_offset(utc):
+    """Hours from UTC for the market's clock. India: +5.5 all year, no daylight
+    saving. New York: -4 in daylight time, -5 otherwise (US rule since 2007)."""
+    if MARKETS[MARKET]["offset"] is not None:
+        return MARKETS[MARKET]["offset"]
     y = utc.year
     start = _dt.datetime.combine(_nth_sunday(y, 3, 2), _dt.time(7, 0))   # 2:00 EST
     end = _dt.datetime.combine(_nth_sunday(y, 11, 1), _dt.time(6, 0))    # 2:00 EDT
@@ -109,11 +132,14 @@ def eastern_offset(utc):
     return -4 if start <= naive < end else -5
 
 
-def to_eastern(utc):
-    """Aware or naive UTC -> naive New York wall-clock time."""
+def to_local(utc):
+    """Aware or naive UTC -> naive market wall-clock time (IST or New York)."""
     if utc.tzinfo is not None:
         utc = utc.astimezone(_dt.timezone.utc)
-    return utc.replace(tzinfo=None) + _dt.timedelta(hours=eastern_offset(utc))
+    return utc.replace(tzinfo=None) + _dt.timedelta(hours=local_offset(utc))
+
+
+eastern_offset, to_eastern = local_offset, to_local   # the upstream names
 
 
 # ---------------------------------------------------------------- inputs
@@ -192,7 +218,16 @@ class Fetcher(object):
 
 
 def yahoo_symbol(ticker):
-    return ticker.upper().replace(".", "-")
+    """NSE: RELIANCE -> RELIANCE.NS, M&M -> M%26M.NS (URL-quoted). NYSE: BRK.B -> BRK-B."""
+    t = ticker.upper()
+    if MARKET == "in":
+        return urllib.parse.quote(t if t.endswith(".NS") else t + ".NS")
+    return t.replace(".", "-")
+
+
+def rss_url(ticker):
+    m = MARKETS[MARKET]
+    return YAHOO.replace("region=US&lang=en-US", "region=%s&lang=%s" % (m["region"], m["lang"])) % yahoo_symbol(ticker)
 
 
 def cik_map(fetcher, state):
@@ -383,7 +418,7 @@ def collect(fetcher, watch, state, sec=True, forms=("8-K",), count=10, errors=No
     items = []
     for t in sorted(watch):
         try:
-            items += parse_rss(fetcher.get(YAHOO % yahoo_symbol(t), "yahoo-%s.xml" % t), t)
+            items += parse_rss(fetcher.get(rss_url(t), "yahoo-%s.xml" % t), t)
         except NewsError as exc:
             errors.append("headlines for %s: %s" % (t, exc))
     if sec:
@@ -439,7 +474,7 @@ def render_moves(moves, move_pct=MOVE_PCT):
     out = []
     for m in moves:
         flag = "MOVING" if abs(m["pct"]) >= move_pct else ""
-        when = (" at %s ET" % to_eastern(m["time"]).strftime("%H:%M")) if m.get("time") else ""
+        when = (" at %s %s" % (to_local(m["time"]).strftime("%H:%M"), ZONE)) if m.get("time") else ""
         out.append("%-6s %s %+.2f%% vs yesterday's close %s%s  %s" % (
             m["ticker"], "{:,.2f}".format(m["price"]), m["pct"], "{:,.2f}".format(m["prev_close"]),
             when, flag))
@@ -453,7 +488,7 @@ def render(items, errors, now, moves=None, move_pct=MOVE_PCT):
     if not items:
         out.append("Nothing new.")
     for it in items:
-        when = to_eastern(it["time"]).strftime("%Y-%m-%d %H:%M ET") if it["time"] else "time unknown"
+        when = to_local(it["time"]).strftime("%Y-%m-%d %H:%M ") + ZONE if it["time"] else "time unknown"
         mark = "!" if it.get("important") else " "
         who = ",".join(it["touches"]) or it["ticker"]
         out.append("%s %s  %-11s %-13s %s" % (mark, when, who, it["source"], it["title"]))
@@ -465,7 +500,7 @@ def render(items, errors, now, moves=None, move_pct=MOVE_PCT):
     for e in errors:
         out.append("note: %s" % e)
     out.append("Checked %s. Headlines are leads, not facts; open the story before acting. "
-               "Not financial advice." % to_eastern(now).strftime("%Y-%m-%d %H:%M ET"))
+               "Not financial advice." % (to_local(now).strftime("%Y-%m-%d %H:%M ") + ZONE))
     return "\n".join(out) + "\n"
 
 
@@ -497,7 +532,9 @@ def main(argv=None):
     ap.add_argument("--now", help="ISO time, for reproducible runs")
     ap.add_argument("--dry-run", action="store_true", help="do not update the state file")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--market", choices=sorted(MARKETS), help='"in" NSE (default) or "us" NYSE; else config "market"')
     args = ap.parse_args(argv)
+    set_market(args.market or (load_json(args.config) or {}).get("market") or MARKET)
 
     if args.tickers:
         watch = {t.upper(): None for t in args.tickers}
@@ -513,7 +550,10 @@ def main(argv=None):
     state = load_json(args.state) or {}
     errors = []
     ua = sec_user_agent(args.user_agent, args.config)
-    sec = not args.no_sec
+    sec = not args.no_sec and MARKETS[MARKET]["sec"]   # SEC 8-Ks are US filings; NSE announcements are Phase 1
+    if MARKET == "in":
+        errors.append("NSE: Yahoo's headline feed matches .NS tickers loosely (unrelated stories slip in) and "
+                      "there is no SEC filing; check NSE corporate announcements before acting on a headline")
     if sec and not ua and not args.offline:
         errors.append("SEC filings skipped: set sec_user_agent in trader/config.json or "
                       "SEC_USER_AGENT (\"Your Name you@example.com\") to include them")

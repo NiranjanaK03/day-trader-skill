@@ -160,6 +160,18 @@ It never places an order, never edits an order to make it pass, never
 loosens a limit, never blocks a sell that only gets the user out, and never
 treats a PASS as the user's yes.
 
+## India (NSE), the default in this fork
+
+With `"market": "in"`: the window is India time (9:30 to 14:45 by default,
+the session 9:15 to 15:30, NSE holidays); NSE symbols pass the asset check
+(RELIANCE, M&M, BAJAJ-AUTO); amounts print in rupees. The loss check, the
+reward:risk check and the daily loss all include the round trip's charges,
+with the same rates and arithmetic as trader-budget (`"costs"` in the config).
+200 RELIANCE at a 12.45 risk is Rs 2,490 at the stop, plus Rs 133.61 of
+charges: Rs 2,623.61, blocked by a Rs 2,500 max loss. `pdt_guard` does not apply in India.
+Not checked yet (Phase 1): distance to the stock's price band, the ASM/GSM
+surveillance lists and the F&O ban list.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.

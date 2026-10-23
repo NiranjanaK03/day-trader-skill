@@ -97,6 +97,17 @@ ticker has no news, say so rather than padding the brief.
 - Never hammers a server: one request per feed per ticker, a pause between
   calls, and SEC's 10 requests a second limit stays far away.
 
+## India (NSE), the default in this fork
+
+With `"market": "in"`: times print in India time (IST), the price line reads
+Yahoo's SYMBOL.NS chart, and the headline feed asks Yahoo for region IN. SEC
+filings are off (they are US filings). Yahoo's headline feed matches .NS
+tickers loosely: unrelated stories slip in (a US company's press release
+under M&M on 2026-10-23), and the tool says so in a note. Treat every NSE
+headline as a lead and check the company's announcements on nseindia.com
+before telling the user anything happened. NSE corporate announcements as a
+feed are Phase 1.
+
 ## Safety
 
 Education and tooling, not financial advice. This skill only reads and

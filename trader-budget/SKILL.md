@@ -159,7 +159,9 @@ margin or short positions.
 `config.example.json` here is the India config (`"market": "in"`): Rs
 5,00,000 budget, 10 % cash buffer, 40 % position cap, Rs 2,500 max loss a
 trade, Rs 7,500 a day, 3 trades, reward:risk 1.5 after charges, entries 9:30
-to 14:45, flat by 15:10, `"broker": "manual"`. The `*_usd` keys hold rupees.
+to 14:45, flat by 15:10, `"broker": "manual"`, and trader-risk's NSE rules
+(`require_nse_lists`, `block_fo_ban`, `block_surveillance`,
+`min_price_band_pct` 10, `band_buffer_pct` 3). The `*_usd` keys hold rupees.
 The US config is `config.us.example.json`. Ask the user for each value in
 rupees, as in Step 1.
 

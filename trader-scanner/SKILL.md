@@ -201,6 +201,12 @@ With `"market": "in"` (trader/config.json, or `--market in`):
   delivery only, no intraday) and, by default, the F&O stocks (`--list fo`,
   213 on 2026-10-23); `--list nifty200` or `--list all` widen it. `--offline
   DIR` reads the same file names from a folder.
+- `scan.py nse-lists`, every morning before the open: today's price bands
+  and series (NSE's sec_list.csv), the F&O ban (fo_secban.csv) and the ASM
+  and GSM surveillance lists, into `trader/nse.json`. trader-risk blocks
+  entries without today's file. On 2026-10-26: 3,597 symbols, 3 in the F&O
+  ban (AMBUJACEM, KAYNES, SAIL), 188 under ASM, 77 under GSM. A list NSE
+  does not serve is named in the output and in the file's `missing`.
 - Symbols stay NSE's (RELIANCE, M&M, BAJAJ-AUTO); Yahoo reads them as
   RELIANCE.NS.
 - Times are India time. The opening range is 9:15 to 9:30, so `orb` runs

@@ -169,8 +169,24 @@ reward:risk check and the daily loss all include the round trip's charges,
 with the same rates and arithmetic as trader-budget (`"costs"` in the config).
 200 RELIANCE at a 12.45 risk is Rs 2,490 at the stop, plus Rs 133.61 of
 charges: Rs 2,623.61, blocked by a Rs 2,500 max loss. `pdt_guard` does not apply in India.
-Not checked yet (Phase 1): distance to the stock's price band, the ASM/GSM
-surveillance lists and the F&O ban list.
+
+Every NSE entry is also checked against `trader/nse.json`, which
+`scan.py nse-lists` writes each morning from NSE's own files (pass `--nse`
+for another path), and against the previous close in `trader/prices.json`
+(`alerts.py quote SYMBOL --write` puts it there). An entry is blocked when:
+
+| check | blocks when | config |
+| --- | --- | --- |
+| nse lists | there is no nse.json, or it is for another day | `require_nse_lists` (true) |
+| series | the stock trades in BE or BZ: trade-to-trade, delivery only | always |
+| F&O ban | it is in today's F&O ban | `block_fo_ban` (true) |
+| surveillance | it is under ASM or GSM | `block_surveillance` (true) |
+| price band | its fixed band is under `min_price_band_pct` (10); the target is past today's band (it cannot fill); the stop is past the other band (the stock can lock there first); a long entry is within `band_buffer_pct` (3) of the upper band | `min_price_band_pct`, `band_buffer_pct` |
+
+Today's band is the previous close plus or minus the band. F&O stocks have no
+fixed band (a dynamic one that flexes), so only the lists apply to them. A
+check that cannot run (no previous close, a list NSE did not serve) is said
+as a warning, never skipped silently. Exits are never blocked by any of this.
 
 ## Safety
 

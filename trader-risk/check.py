@@ -54,6 +54,19 @@ What blocks an entry (on top):
   pdt           only with "pdt_guard": true: 3 day trades already in the last
                 5 business days (a 4th would trip the old pattern-day-trader rule)
 
+On NSE ("market": "in") an entry is also checked against trader/nse.json
+(scan.py nse-lists, read each morning) and the previous close in prices.json:
+
+  nse lists     no trader/nse.json, or one for another day ("require_nse_lists")
+  series        a trade-to-trade series (BE, BZ): delivery only, no intraday
+  F&O ban       the stock is in today's F&O ban ("block_fo_ban")
+  surveillance  the stock is under ASM or GSM ("block_surveillance")
+  price band    a fixed band under "min_price_band_pct" (10); a target past
+                today's band (it cannot fill); a stop past the other band (the
+                stock can lock at the band first); a long entry within
+                "band_buffer_pct" (3) of the upper band. F&O stocks have a
+                dynamic band instead, so only the lists apply to them.
+
 Exit code 0 when every order passes, 1 when any order is blocked.
 The verdicts go to trader/state/risk.json with a fingerprint of each order,
 so trader-broker only shows an order as ready if THIS exact order passed today.
@@ -159,6 +172,15 @@ COSTS_NSE = {
     "sebi_per_crore": 10.0,    # SEBI turnover fee, Rs 10 a crore, both sides
     "stamp_buy_pct": 0.003,    # stamp duty, intraday: buy side only
     "gst_pct": 18.0,           # GST on brokerage + exchange + SEBI charges
+}
+
+
+NSE_RULES = {  # India only; any of them can be set in trader/config.json
+    "require_nse_lists": True,   # no entry without today's trader/nse.json (scan.py nse-lists)
+    "block_fo_ban": True,        # no entry in a stock in the F&O ban
+    "block_surveillance": True,  # no entry in a stock under ASM or GSM
+    "min_price_band_pct": 10,    # a 2 % or 5 % band can lock the stock at either limit
+    "band_buffer_pct": 3,        # no long entry within this % under the upper band
 }
 
 
@@ -332,6 +354,67 @@ def window_check(now_et, c):
     return [], warns
 
 
+def nse_checks(sym, side, ref, stop, target, c, nse, prev_close, today):
+    """India: ([reasons], [warnings]) for an entry in sym on NSE today, from trader/nse.json
+    (scan.py nse-lists) and the previous close in trader/prices.json. It blocks when the lists
+    are missing or old, the stock is trade-to-trade, in the F&O ban or under ASM/GSM, its price
+    band is narrow, or the band cuts across the plan: a target past the band cannot fill, and a
+    stop past the other band may never get the chance (the stock can lock at the band first)."""
+    r = dict(NSE_RULES)
+    r.update({k: c[k] for k in NSE_RULES if k in c})
+    reasons, warns = [], []
+
+    def say(msg, block):
+        (reasons if block else warns).append(msg)
+
+    if not nse:
+        say("nse lists: no trader/nse.json, so the price band, the F&O ban and ASM/GSM are unchecked: "
+            "run scan.py nse-lists before the open", r["require_nse_lists"])
+        return reasons, warns
+    if nse.get("trade_date") != today:
+        say("nse lists: trader/nse.json is for %s, not today (%s): run scan.py nse-lists"
+            % (nse.get("trade_date"), today), r["require_nse_lists"])
+    for f in nse.get("missing") or []:
+        warns.append("nse lists: %s could not be read, so what it lists is unchecked" % f)
+    series = (nse.get("series") or {}).get(sym)
+    if series is None:
+        warns.append("nse lists: %s is not in NSE's security list" % sym)
+    elif series != "EQ":
+        reasons.append("series: %s trades in series %s: trade-to-trade, delivery only, no intraday" % (sym, series))
+    if sym in (nse.get("fo_ban") or []):
+        say("F&O ban: %s is in today's F&O ban (its open interest is over 95%% of the market-wide limit): "
+            "expect sharp, crowded moves" % sym, r["block_fo_ban"])
+    for key, word in (("asm", "ASM"), ("gsm", "GSM")):
+        stage = (nse.get(key) or {}).get(sym)
+        if stage:
+            say("surveillance: %s is under %s (%s): higher margins or trade-to-trade, and wide swings"
+                % (sym, word, stage), r["block_surveillance"])
+    if sym not in (nse.get("bands") or {}) or nse["bands"][sym] is None:
+        return reasons, warns   # unknown, or a dynamic band (every F&O stock): no fixed limit to check
+    band = float(nse["bands"][sym])
+    if band < float(r["min_price_band_pct"]) - 1e-9:
+        reasons.append("price band: %s has a %s%% band, under your %s%% minimum: it can lock at either limit "
+                       "and leave you unable to get out" % (sym, _num(band), _num(r["min_price_band_pct"])))
+    if not prev_close:
+        warns.append("price band: no previous close for %s in trader/prices.json, so its %s%% band is not checked "
+                     "against the plan (alerts.py quote %s --write)" % (sym, _num(band), sym))
+        return reasons, warns
+    upper, lower = _cent(prev_close * (1 + band / 100.0)), _cent(prev_close * (1 - band / 100.0))
+    where = "previous close %s, %s%% band: %s to %s" % (_p(prev_close), _num(band), _p(lower), _p(upper))
+    top, bottom = (upper, lower) if side == "buy" else (lower, upper)
+    if target and (target > upper + CENT if side == "buy" else target < lower - CENT):
+        reasons.append("price band: the target %s is past today's band %s (%s): it cannot fill"
+                       % (_p(target), _p(top), where))
+    if stop and (stop < lower - CENT if side == "buy" else stop > upper + CENT):
+        reasons.append("price band: the stop %s is past today's band %s (%s): the stock can lock at the band "
+                       "before your stop fills" % (_p(stop), _p(bottom), where))
+    buf = float(r["band_buffer_pct"]) / 100.0
+    if ref and (ref >= upper * (1 - buf) if side == "buy" else ref <= lower * (1 + buf)):
+        reasons.append("price band: the entry %s is within %s%% of the band %s (%s)"
+                       % (_p(ref), _num(r["band_buffer_pct"]), _p(top), where))
+    return reasons, warns
+
+
 def business_days(today, n=5):
     """The last n NYSE trading days up to and including today, newest first."""
     out, d = [], today
@@ -460,11 +543,14 @@ def day_trades(state, today):
 
 # ---------------------------------------------------------------- the check
 
-def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None):
+def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None,
+          nse=None, prev_closes=None):
     """Pure function. Returns {"results": [...], "pass": n, "block": n, "warnings": [...]}.
 
-    now          naive UTC (default: the real clock); its New York date is "today"
-    price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh"""
+    now          naive UTC (default: the real clock); its market date is "today"
+    price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh
+    nse          India: trader/nse.json (price bands, F&O ban, ASM/GSM); see nse_checks
+    prev_closes  India: {SYM: previous close}, for the price band"""
     c = dict(DEFAULTS)
     c.update(cfg or {})
     prices = {str(k).upper(): float(v) for k, v in (prices or {}).items() if _f(v)}
@@ -736,6 +822,11 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 later.append("trades: %d entries placed today plus %d passed earlier in this batch, your limit "
                              "is %d a day" % (len(entries_today), batch_entries, cap_t))
             later.extend(win_reasons)
+            if MARKET == "in" and sym:
+                nse_reasons, nse_warns = nse_checks(sym, side, ref, stop, target, c, nse,
+                                                    (prev_closes or {}).get(sym), today)
+                later.extend(nse_reasons)
+                warns.extend(nse_warns)
             if c.get("pdt_guard") and pdt_n >= 3:
                 later.append("pdt: %d day trades in the last 5 business days (%s); a 4th trips the "
                              "pattern-day-trader rule your broker applies (\"pdt_guard\": true)"
@@ -886,6 +977,8 @@ def main(argv=None):
                     help="your account; if missing, a fresh account funded with the budget")
     ap.add_argument("--prices", default="trader/prices.json")
     ap.add_argument("--state", default="trader/state/broker.json", help="what trader-broker placed today")
+    ap.add_argument("--nse", default="trader/nse.json", help="NSE: today's price bands, F&O ban and ASM/GSM "
+                    "lists (scan.py nse-lists)")
     ap.add_argument("--now", help="pretend it is this market time, e.g. \"2026-10-19 10:15\"")
     ap.add_argument("--today", help="YYYY-MM-DD (default: today in market time)")
     ap.add_argument("--market", choices=sorted(MARKETS), help='"in" NSE (default: rupees, Indian charges) or '
@@ -908,7 +1001,9 @@ def main(argv=None):
         pdoc = read_json(a.prices, "prices", required=False) or {}
         prices, times = load_prices(pdoc)
         state = read_json(a.state, "broker state", required=False)
-        res = check(orders, cfg, portfolio, prices, state, a.today, now, times)
+        nse = read_json(a.nse, "NSE lists", required=False) if MARKET == "in" else None
+        prev = {str(s).upper(): _f((d or {}).get("prev_close")) for s, d in (pdoc.get("detail") or {}).items()}
+        res = check(orders, cfg, portfolio, prices, state, a.today, now, times, nse, prev)
         if pdoc.get("as_of"):
             res["prices_as_of"] = pdoc["as_of"]
         if not a.no_write:

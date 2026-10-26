@@ -47,6 +47,18 @@ def ist(text):
     return DT.strptime(text, "%Y-%m-%d %H:%M") - datetime.timedelta(hours=5, minutes=30)
 
 
+def nse_lists(trade_date=None):
+    """trader/nse.json built from NSE's real files of 2026-10-26 (trimmed), optionally re-dated."""
+    texts = {}
+    for f in scan.NSE_DAILY:
+        with open(os.path.join(IN, f), encoding="utf-8") as fh:
+            texts[f] = fh.read()
+    doc = scan.build_nse_lists(texts, "2026-10-26T03:00:00Z", "2026-10-26")
+    if trade_date:
+        doc["trade_date"] = trade_date
+    return doc
+
+
 def quiet(fn, *args):
     out = io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
@@ -299,13 +311,15 @@ class Sizing(unittest.TestCase):
 
 
 class Risk(unittest.TestCase):
+    NSE = nse_lists("2026-10-19")
+
     def order(self, qty):
         return {"symbol": "RELIANCE", "side": "buy", "qty": str(qty), "type": "market", "time_in_force": "day",
                 "order_class": "bracket", "take_profit_limit_price": "1252.70", "stop_loss_stop_price": "1215.35",
                 "plan": {"entry": 1227.8, "stop": 1215.35, "target": 1252.7}}
 
     def test_pass_with_charges_in_the_max_loss(self):
-        res = check.check([self.order(162)], INDIA_CFG, now=ist("2026-10-19 09:50"))
+        res = check.check([self.order(162)], INDIA_CFG, now=ist("2026-10-19 09:50"), nse=self.NSE)
         r = res["results"][0]
         self.assertEqual(r["verdict"], "PASS", r["reasons"])
         self.assertIn("max loss Rs 2,134.09 with Rs 117.19 charges", " ".join(r["info"]))
@@ -313,7 +327,7 @@ class Risk(unittest.TestCase):
 
     def test_the_charges_can_tip_an_order_over_the_limit(self):
         cfg = dict(INDIA_CFG, max_position_pct=100, max_order_usd=10 ** 7)
-        res = check.check([self.order(200)], cfg, now=ist("2026-10-19 09:50"))   # 200 x 12.45 = 2,490
+        res = check.check([self.order(200)], cfg, now=ist("2026-10-19 09:50"), nse=self.NSE)   # 200 x 12.45 = 2,490
         r = res["results"][0]
         self.assertEqual(r["verdict"], "BLOCK")
         self.assertTrue(any(x.startswith("loss: 200 shares x 12.45 risk a share = Rs 2,490 at the stop, plus")
@@ -321,10 +335,95 @@ class Risk(unittest.TestCase):
 
     def test_nse_symbols_pass_the_asset_check(self):
         o = dict(self.order(1), symbol="M&M")
-        r = check.check([o], INDIA_CFG, now=ist("2026-10-19 09:50"))["results"][0]
+        r = check.check([o], INDIA_CFG, now=ist("2026-10-19 09:50"), nse=self.NSE)["results"][0]
         self.assertFalse([x for x in r["reasons"] if x.startswith("asset")])
-        r = check.check([dict(self.order(1), symbol="BRK.B")], INDIA_CFG, now=ist("2026-10-19 09:50"))["results"][0]
+        r = check.check([dict(self.order(1), symbol="BRK.B")], INDIA_CFG, now=ist("2026-10-19 09:50"),
+                        nse=self.NSE)["results"][0]
         self.assertTrue([x for x in r["reasons"] if "NSE stock" in x])
+
+
+class NseLists(unittest.TestCase):
+    """Price bands, the F&O ban and ASM/GSM, from NSE's real files for 2026-10-26."""
+
+    def test_the_lists(self):
+        doc = nse_lists()
+        self.assertEqual(doc["trade_date"], "2026-10-26")   # from the F&O ban file's own header
+        self.assertEqual(doc["fo_ban"], ["AMBUJACEM", "KAYNES", "SAIL"])
+        self.assertIsNone(doc["bands"]["RELIANCE"])          # F&O stock: a dynamic band
+        self.assertEqual((doc["bands"]["20MICRONS"], doc["bands"]["21STCENMGM"]), (20.0, 5.0))
+        self.assertEqual(doc["series"]["AGSTRA"], "BZ")
+        self.assertIn("long-term ASM", doc["asm"]["21STCENMGM"])
+        self.assertIn("GSM", doc["gsm"]["AGSTRA"])
+        self.assertEqual(doc["missing"], [])
+
+    def test_command_offline(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "nse.json")
+            code, text = quiet(scan.main, ["nse-lists", "--offline", IN, "--out", out, "--market", "in",
+                                           "--now", "2026-10-26 08:45"])
+            self.assertEqual(code, 0)
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["fo_ban"], ["AMBUJACEM", "KAYNES", "SAIL"])
+        self.assertIn("F&O ban today: AMBUJACEM, KAYNES, SAIL.", text)
+
+    def test_a_missing_file_is_said_not_hidden(self):
+        with open(os.path.join(IN, "sec_list.csv"), encoding="utf-8") as fh:
+            doc = scan.build_nse_lists({"sec_list.csv": fh.read()}, "2026-10-26T03:00:00Z", "2026-10-26")
+        self.assertEqual(doc["missing"], ["fo_secban.csv", "asm.json", "gsm.json"])
+
+    def run1(self, sym, entry, stop, target, qty=100, cfg=None, nse="today", prev=None):
+        o = {"symbol": sym, "side": "buy", "qty": str(qty), "type": "market", "time_in_force": "day",
+             "order_class": "bracket", "take_profit_limit_price": "%.2f" % target, "stop_loss_stop_price": "%.2f" % stop,
+             "plan": {"entry": entry, "stop": stop, "target": target}}
+        lists = nse_lists() if nse == "today" else nse
+        res = check.check([o], cfg or INDIA_CFG, now=ist("2026-10-26 10:00"), nse=lists, prev_closes=prev or {})
+        return res["results"][0]
+
+    def blocked(self, r, start):
+        return [x for x in r["reasons"] if x.startswith(start)]
+
+    def test_no_lists_or_old_lists_block_entries(self):
+        r = self.run1("RELIANCE", 1200, 1188, 1224, qty=10, nse=None)
+        self.assertTrue(self.blocked(r, "nse lists: no trader/nse.json"), r["reasons"])
+        r = self.run1("RELIANCE", 1200, 1188, 1224, qty=10, nse=nse_lists("2026-10-23"))
+        self.assertTrue(self.blocked(r, "nse lists: trader/nse.json is for 2026-10-23, not today"), r["reasons"])
+        cfg = dict(INDIA_CFG, require_nse_lists=False)
+        r = self.run1("RELIANCE", 1200, 1188, 1224, qty=10, cfg=cfg, nse=None)
+        self.assertEqual(r["verdict"], "PASS", r["reasons"])
+        self.assertTrue([w for w in r["warnings"] if w.startswith("nse lists")])
+
+    def test_fo_ban_and_surveillance(self):
+        r = self.run1("AMBUJACEM", 560, 552, 576)
+        self.assertTrue(self.blocked(r, "F&O ban: AMBUJACEM"), r["reasons"])
+        r = self.run1("AMBUJACEM", 560, 552, 576, cfg=dict(INDIA_CFG, block_fo_ban=False))
+        self.assertFalse(self.blocked(r, "F&O ban"))
+        self.assertTrue([w for w in r["warnings"] if w.startswith("F&O ban")])
+        r = self.run1("21STCENMGM", 100, 98, 104, prev={"21STCENMGM": 100})
+        self.assertTrue(self.blocked(r, "surveillance: 21STCENMGM is under ASM"), r["reasons"])
+        self.assertTrue(self.blocked(r, "price band: 21STCENMGM has a 5% band"), r["reasons"])
+        r = self.run1("AGSTRA", 10, 9.9, 10.2, prev={"AGSTRA": 10})
+        self.assertTrue(self.blocked(r, "series: AGSTRA trades in series BZ"), r["reasons"])
+        self.assertTrue(self.blocked(r, "surveillance: AGSTRA is under GSM"), r["reasons"])
+
+    def test_the_band_against_the_plan(self):
+        prev = {"20MICRONS": 100}   # a 20 % band: 80.00 to 120.00
+        r = self.run1("20MICRONS", 104, 100, 112, prev=prev)
+        self.assertEqual(r["verdict"], "PASS", r["reasons"])
+        r = self.run1("20MICRONS", 110, 105, 125, prev=prev)
+        self.assertTrue(self.blocked(r, "price band: the target 125.00 is past today's band 120.00"), r["reasons"])
+        r = self.run1("20MICRONS", 117, 112, 119.5, prev=prev)   # 117 is within 3 % of 120
+        self.assertTrue(self.blocked(r, "price band: the entry 117.00 is within 3% of the band 120.00"), r["reasons"])
+        r = self.run1("20MICRONS", 84, 79, 95, prev=prev)
+        self.assertTrue(self.blocked(r, "price band: the stop 79.00 is past today's band 80.00"), r["reasons"])
+        r = self.run1("20MICRONS", 104, 100, 112)   # no previous close: said, not blocked
+        self.assertEqual(r["verdict"], "PASS", r["reasons"])
+        self.assertTrue([w for w in r["warnings"] if w.startswith("price band: no previous close")])
+
+    def test_exits_are_never_blocked_by_the_lists(self):
+        o = {"symbol": "AMBUJACEM", "side": "sell", "qty": "10", "type": "market", "time_in_force": "day"}
+        pf = {"cash": 100000, "positions": [{"ticker": "AMBUJACEM", "shares": 10}]}
+        r = check.check([o], INDIA_CFG, portfolio=pf, now=ist("2026-10-26 15:05"), nse=None)["results"][0]
+        self.assertEqual(r["verdict"], "PASS", r["reasons"])
 
 
 class Broker(unittest.TestCase):
@@ -358,6 +457,8 @@ class Pipeline(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p = lambda name: os.path.join(d, name)   # noqa: E731
             now = ["--now", "2026-10-19 09:50"]
+            with open(p("nse.json"), "w", encoding="utf-8") as fh:
+                json.dump(nse_lists("2026-10-19"), fh)
             self.assertEqual(quiet(entry.main, ["check", "RELIANCE", "--offline", FIVE_DAYS, "--config", CFG,
                                                 "--write", p("entry.json")] + now)[0], 0)
             self.assertEqual(quiet(exit_.main, ["plan", "--from", p("entry.json"), "--config", CFG,
@@ -366,7 +467,7 @@ class Pipeline(unittest.TestCase):
                                                "--write", p("orders.json")] + now)[0], 0)
             code, text = quiet(check.main, ["--orders", p("orders.json"), "--config", CFG, "--portfolio", p("none"),
                                             "--prices", p("none.json"), "--state", p("broker.json"),
-                                            "--out", p("risk.json")] + now)
+                                            "--nse", p("nse.json"), "--out", p("risk.json")] + now)
             self.assertEqual(code, 0, text)
             code, text = quiet(ticket.main, ["show", "--orders", p("orders.json"), "--config", CFG,
                                              "--risk", p("risk.json"), "--state", p("broker.json")] + now)

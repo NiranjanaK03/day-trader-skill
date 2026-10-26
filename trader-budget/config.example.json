@@ -22,6 +22,11 @@
   "allow_margin": false,
   "allow_short": false,
   "pdt_guard": false,
+  "require_nse_lists": true,
+  "block_fo_ban": true,
+  "block_surveillance": true,
+  "min_price_band_pct": 10,
+  "band_buffer_pct": 3,
   "costs": {
     "brokerage_pct": 0.03,
     "brokerage_max": 20.0,

@@ -50,13 +50,19 @@ first 0.6 %, stop first 17.3 %, "Strongly toward the stop". Sized on Rs
 plus Rs 117.19 of charges, reward:risk 1.83 after charges: trader-risk passes
 it, and the ticket says you place it yourself.
 
+Phase 1, done so far: the NSE risk checks. `scan.py nse-lists` reads NSE's
+daily price bands, F&O ban and ASM/GSM lists into `trader/nse.json` each
+morning, and trader-risk blocks an entry that is trade-to-trade, in the F&O
+ban, under surveillance, in a narrow band, or whose target or stop is past
+today's price band (details in `trader-risk/SKILL.md`).
+
 Not done yet (Phase 1): an Indian broker connection (Kite Connect or another
 broker's API on a whitelisted static IP, under SEBI's 2026 retail algo rules),
 real-time data instead of Yahoo, NSE corporate announcements for
 `/trader-news` (Yahoo's headline feed matches `.NS` tickers loosely),
-fundamentals from NSE/BSE filings for `/trader-analyst` (SEC only today),
-price-band and surveillance-list checks, and the 2027 NSE holidays (NSE
-publishes them in December). `/trader-pelosi` stays US-only.
+fundamentals from NSE/BSE filings for `/trader-analyst` (SEC only today), a
+one-year backtest with charges, and the 2027 NSE holidays (NSE publishes them
+in December). `/trader-pelosi` stays US-only.
 
 > **Looking for the original Trader skill?** Copy an investor's 13F, the
 > stock screener, tax lots and rebalancing live in

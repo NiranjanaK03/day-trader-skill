@@ -69,8 +69,10 @@ Exit code 0 when the scan found something, 1 when it did not or could not run.
 """
 
 import argparse
+import csv
 import datetime
 import gzip
+import io
 import json
 import os
 import re
@@ -90,6 +92,15 @@ NSE_FILES = {  # file name -> where NSE publishes it
     "ind_nifty200list.csv": "https://niftyindices.com/IndexConstituent/ind_nifty200list.csv",
 }
 NSE_LISTS = {"fo": "fo_mktlots.csv", "nifty200": "ind_nifty200list.csv", "all": None}
+NSE_DAILY = {  # nse-lists: what can stop an intraday trade today, re-read every morning
+    "sec_list.csv": "https://nsearchives.nseindia.com/content/equities/sec_list.csv",   # price band, series
+    "fo_secban.csv": "https://nsearchives.nseindia.com/content/fo/fo_secban.csv",       # F&O ban list
+    "asm.json": "https://www.nseindia.com/api/reportASM",                               # ASM, long and short term
+    "gsm.json": "https://www.nseindia.com/api/reportGSM",                               # GSM
+}
+DEFAULT_NSE = "trader/nse.json"
+MONTHS = {m: i + 1 for i, m in enumerate(("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT",
+                                           "NOV", "DEC"))}
 BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 SPARK_MAX = 20      # Yahoo's spark answers 400 above 20 symbols
 PAUSE = 0.3         # seconds between requests: be polite to free endpoints
@@ -634,6 +645,74 @@ def build_universe_nse(texts, scope="fo"):
     return sorted(kept.items()), counts, None
 
 
+def _quoted_csv(text):
+    """sec_list.csv quotes its Remarks ("GSM STAGE - 0"): the csv module, headers stripped."""
+    rows = list(csv.DictReader(io.StringIO(text.replace("\r", ""))))
+    return [{(k or "").strip(): (v or "").strip() for k, v in r.items()} for r in rows]
+
+
+def build_nse_lists(texts, fetched_at, today):
+    """{filename: text or None} -> the nse.json document trader-risk reads.
+
+    bands     {SYM: 2, 5, 10, 20 or 40 (percent either way from the previous close), or
+              null for "No Band": a dynamic band instead, as for every F&O stock (it starts
+              at 10 % and flexes when hit)}
+    series    {SYM: EQ, BE, BZ ...}; BE and BZ are trade-to-trade (delivery only)
+    fo_ban    symbols in the F&O ban for the trade date (open interest over 95 % of the limit)
+    asm, gsm  {SYM: the surveillance stage}
+    missing   the files that could not be read; trader-risk says what it could not check"""
+    doc = {"created_by": "trader-scanner", "fetched_at": fetched_at, "trade_date": today, "bands": {},
+           "series": {}, "fo_ban": [], "asm": {}, "gsm": {}, "missing": []}
+    sec = texts.get("sec_list.csv")
+    if sec:
+        rows = _quoted_csv(sec)
+        if not rows or "Band" not in rows[0] or "Symbol" not in rows[0]:
+            raise ScanError("not NSE's sec_list.csv (no Symbol / Band columns)")
+        for r in sorted(rows, key=lambda r: r.get("Series") != "EQ"):   # an EQ row wins over BE/BZ
+            sym = r["Symbol"].upper()
+            if sym in doc["series"]:
+                continue
+            band = r.get("Band", "")
+            doc["bands"][sym] = float(band) if re.match(r"^\d+(\.\d+)?$", band) else None
+            doc["series"][sym] = r.get("Series", "")
+            m = re.match(r"^GSM STAGE - (\w+)$", r.get("Remarks", "").upper())
+            if m:
+                doc["gsm"][sym] = "GSM Stage " + m.group(1)
+    else:
+        doc["missing"].append("sec_list.csv")
+    ban = texts.get("fo_secban.csv")
+    if ban is not None:
+        lines = [ln.strip() for ln in ban.replace("\r", "").split("\n") if ln.strip()]
+        m = re.search(r"(\d{2})-([A-Z]{3})-(\d{4})", lines[0].upper()) if lines else None
+        if m and m.group(2) in MONTHS:
+            doc["trade_date"] = "%s-%02d-%s" % (m.group(3), MONTHS[m.group(2)], m.group(1))
+        for ln in lines[1:]:
+            parts = [p.strip() for p in ln.split(",")]
+            if len(parts) >= 2 and parts[1]:
+                doc["fo_ban"].append(parts[1].upper())
+    else:
+        doc["missing"].append("fo_secban.csv")
+    asm = texts.get("asm.json")
+    if asm:
+        data = json.loads(asm)
+        for term in ("longterm", "shortterm"):
+            for r in ((data.get(term) or {}).get("data") or []):
+                if r.get("symbol"):
+                    doc["asm"][r["symbol"].upper()] = "%s, %s" % (
+                        "long-term ASM" if term == "longterm" else "short-term ASM", r.get("asmSurvIndicator") or "")
+    else:
+        doc["missing"].append("asm.json")
+    gsm = texts.get("gsm.json")
+    if gsm:
+        for r in json.loads(gsm) or []:
+            if r.get("symbol"):   # gsmStage is a code (LVIII); survDesc says the stage in words
+                doc["gsm"][r["symbol"].upper()] = r.get("survDesc") or r.get("survCode") or "GSM"
+    else:
+        doc["missing"].append("gsm.json")
+    doc["fo_ban"] = sorted(set(doc["fo_ban"]))
+    return doc
+
+
 # ---------------------------------------------------------------- daily setups
 
 def rsi(closes, n=14):
@@ -1037,6 +1116,47 @@ def nse_universe(a, t0):
     return 0 if kept else 1
 
 
+def cmd_nse_lists(a):
+    """Today's NSE price bands, F&O ban and surveillance lists -> trader/nse.json for trader-risk."""
+    if MARKET != "in":
+        raise ScanError("nse-lists reads NSE's daily lists: it needs \"market\": \"in\"")
+    now = parse_now(a.now)
+    texts = {}
+    for k, fname in enumerate(NSE_DAILY):
+        if a.offline:
+            p = os.path.join(a.offline, fname)
+            if os.path.exists(p):
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    texts[fname] = fh.read()
+            continue
+        if k and a.pause:
+            SLEEP(a.pause)
+        try:
+            texts[fname] = http_get(NSE_DAILY[fname], timeout=60, ua=BROWSER_UA)
+        except (urllib.error.URLError, OSError):
+            texts[fname] = None   # said in "missing"; trader-risk says what it could not check
+    doc = build_nse_lists(texts, now.strftime("%Y-%m-%dT%H:%M:%SZ"), to_local(now).date().isoformat())
+    if not doc["bands"] and "sec_list.csv" in doc["missing"]:
+        raise ScanError("could not read NSE's sec_list.csv (price bands): nothing written")
+    if not a.no_write:
+        write_json(a.out, doc)
+    if a.json:
+        print(json.dumps(dict(doc, bands=len(doc["bands"]), series=len(doc["series"])), indent=2))
+        return 0
+    fixed = [b for b in doc["bands"].values() if b is not None]
+    print("NSE lists for trade date %s, read %s %s." % (doc["trade_date"], to_local(now).strftime("%H:%M"), ZONE))
+    print("Price bands for %s symbols: %s with a fixed band (2 %% to 20 %%), %s with no fixed band (a dynamic "
+          "band, as for every F&O stock)." % ("{:,}".format(len(doc["bands"])), "{:,}".format(len(fixed)),
+                         "{:,}".format(len(doc["bands"]) - len(fixed))))
+    print("F&O ban today: %s." % (", ".join(doc["fo_ban"]) or "none"))
+    print("Under surveillance: %d ASM, %d GSM." % (len(doc["asm"]), len(doc["gsm"])))
+    if doc["missing"]:
+        print("Could not read: %s. trader-risk will say what it could not check." % ", ".join(doc["missing"]))
+    if not a.no_write:
+        print("Wrote %s. trader-risk reads it before every entry." % a.out)
+    return 0
+
+
 def cmd_universe(a):
     t0 = time.time()
     if MARKET == "in":
@@ -1249,6 +1369,15 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
     market_args(p)
 
+    p = sub.add_parser("nse-lists", help="NSE: today's price bands, F&O ban and ASM/GSM lists -> trader/nse.json")
+    p.add_argument("--out", default=DEFAULT_NSE)
+    p.add_argument("--offline", metavar="DIR", help="a folder with sec_list.csv, fo_secban.csv, asm.json, gsm.json")
+    p.add_argument("--now", help='pretend it is this time ("2026-10-26 08:45" market time, or ...Z)')
+    p.add_argument("--no-write", action="store_true")
+    p.add_argument("--pause", type=float, default=PAUSE)
+    p.add_argument("--json", action="store_true")
+    market_args(p)
+
     def common(p, min_price, min_volume):
         g = p.add_mutually_exclusive_group()
         g.add_argument("--symbols", help="comma-separated tickers instead of the universe")
@@ -1289,7 +1418,7 @@ def main(argv=None):
                 a.min_price = m["daily_min_price"]
             if a.min_volume is None:
                 a.min_volume = m["daily_min_volume"] if a.cmd == "daily" else 0
-        return {"universe": cmd_universe, "daily": cmd_daily, "orb": cmd_orb}[a.cmd](a)
+        return {"universe": cmd_universe, "nse-lists": cmd_nse_lists, "daily": cmd_daily, "orb": cmd_orb}[a.cmd](a)
     except ScanError as e:
         print("scan.py: %s" % e, file=sys.stderr)
         return 1

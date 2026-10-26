@@ -36,6 +36,7 @@ check = load("trader-risk", "check", market="in")
 ticket = load("trader-broker", "ticket", market="in")
 alerts = load("trader-alerts", "alerts", market="in")
 news = load("trader-news", "news", market="in")
+bt = load("trader-timemachine", "backtest", market="in")
 CLOCKED = (scan, entry, exit_, tm, size, check, ticket, alerts)
 CALENDARS = (scan, entry, exit_, check, alerts)
 
@@ -450,6 +451,107 @@ class Alerts(unittest.TestCase):
     def test_stooq_is_us_only(self):
         with self.assertRaises(alerts.AlertError):
             alerts.stooq_url("RELIANCE")
+
+
+class Backtest(unittest.TestCase):
+    """The Phase 1 backtest on RELIANCE's 60 days of real 5-minute bars."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.store = os.path.join(cls.tmp.name, "bars")
+        code, cls.collected = quiet(bt.main, ["collect", "--offline", SIXTY_DAYS, "--symbols", "RELIANCE",
+                                              "--store", cls.store, "--config", CFG])
+        assert code == 0, cls.collected
+        cls.bars = bt.load_bars(cls.store, "RELIANCE")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def rules(self, **kw):
+        r = {"or_minutes": 15, "stop": "or-mid", "target_r": 2.0, "slip": 0.0, "first_entry_min": 570,
+             "last_entry_min": 885, "flat_min": 910}
+        r.update(kw)
+        return r
+
+    def test_the_store_keeps_full_sessions_and_merges(self):
+        full, short = bt.sessions(self.bars)
+        self.assertEqual((len(full), short), (59, ["2026-10-15"]))
+        self.assertTrue(all(len(b) == 72 for b in full.values()))
+        self.assertIn("59 stored sessions (2026-07-29 to 2026-10-23)", self.collected)
+        code, text = quiet(bt.main, ["collect", "--offline", SIXTY_DAYS, "--symbols", "RELIANCE",
+                                     "--store", self.store, "--config", CFG])
+        self.assertIn("0 new bars", text)   # the same download twice adds nothing
+
+    def test_the_reel_day_against_the_raw_bars(self):
+        cfg = dict(INDIA_CFG, slippage_pct=0)
+        res = bt.backtest({"RELIANCE": self.bars}, dict(bt.DEFAULTS, **cfg), self.rules(),
+                          "2026-10-19", "2026-10-19")
+        t = res["trades"][0]
+        self.assertEqual((t["entry_time"], t["entry"], t["stop"], t["target"], t["qty"]),
+                         ("9:50", 1227.8, 1215.35, 1252.7, 162))   # as entry, exit and budget said
+        # the exit, found again straight from the bars
+        day = bt.sessions(self.bars)[0]["2026-10-19"]
+        want = None
+        for b in day[7:]:
+            if b["start"] >= 910:
+                want = (b["o"], "flat")
+                break
+            if b["l"] <= 1215.35:
+                want = (min(1215.35, b["o"]), "stop")
+                break
+            if b["h"] >= 1252.7:
+                want = (1252.7, "target")
+                break
+        self.assertEqual((t["exit"], t["reason"]), want)
+        charges = bt.intraday_charges(162, 1227.8, t["exit"])["total"]
+        self.assertEqual(t["net"], round(162 * (t["exit"] - 1227.8) - charges, 2))
+
+    def test_the_numbers_add_up(self):
+        cfg = dict(bt.DEFAULTS, **INDIA_CFG)
+        res = bt.backtest({"RELIANCE": self.bars}, cfg, self.rules(slip=0.0002))
+        s = bt.stats(res["trades"], res["dates"], 500000)
+        self.assertEqual(s["trades"], len(res["trades"]))
+        self.assertAlmostEqual(s["net"], sum(t["net"] for t in res["trades"]), places=2)
+        self.assertAlmostEqual(s["net"], s["gross"] - s["charges"], places=2)
+        self.assertEqual(sum(s["exits"].values()), s["trades"])
+        self.assertTrue(all(t["max_loss"] <= 2500 for t in res["trades"]))
+        self.assertTrue(all(t["qty"] * t["entry"] <= 200000 for t in res["trades"]))
+
+    def test_one_trade_a_day_across_stocks(self):
+        cfg = dict(bt.DEFAULTS, **dict(INDIA_CFG, max_trades_per_day=1))
+        res = bt.backtest({"RELIANCE": self.bars, "TWIN": self.bars}, cfg, self.rules())
+        per_day = {}
+        for t in res["trades"]:
+            per_day[t["date"]] = per_day.get(t["date"], 0) + 1
+        self.assertEqual(max(per_day.values()), 1)
+        self.assertTrue(all(t["symbol"] == "RELIANCE" for t in res["trades"]))   # first come, ties by name
+        self.assertTrue(any(s["why"] == "trades" and s["symbol"] == "TWIN" for s in res["skipped"]))
+
+    def test_the_gate_is_not_yet_on_sixty_days(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "bt.json")
+            code, text = quiet(bt.main, ["run", "--store", self.store, "--config", CFG, "--write", out])
+            with open(out, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        self.assertEqual(code, 1)
+        self.assertFalse(doc["passed"])
+        gate = {g["check"]: g["pass"] for g in doc["gate"]}
+        self.assertEqual((gate["history"], gate["trades"]), (False, False))
+        self.assertIn("59 sessions of history, the gate wants 250 (a year)", text)
+        self.assertEqual(doc["out_of_sample"]["sessions"], 14)   # a quarter of 59, not 63
+
+    def test_a_target_that_cannot_clear_the_minimum_is_explained(self):
+        code, text = quiet(bt.main, ["run", "--store", self.store, "--config", CFG, "--target-r", "1.5"])
+        self.assertIn("59 sessions, no trades.", text)
+        self.assertIn("a 1.5R target can never reach min_reward_risk 1.5 after charges", text)
+
+    def test_a_chart_for_another_stock_is_refused(self):
+        with gzip.open(SIXTY_DAYS, "rt", encoding="utf-8") as fh:
+            text = fh.read()
+        with self.assertRaises(bt.BacktestError):
+            bt.chart_bars(text, "TCS")
 
 
 class Pipeline(unittest.TestCase):

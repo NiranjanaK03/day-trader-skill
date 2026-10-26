@@ -54,15 +54,21 @@ Phase 1, done so far: the NSE risk checks. `scan.py nse-lists` reads NSE's
 daily price bands, F&O ban and ASM/GSM lists into `trader/nse.json` each
 morning, and trader-risk blocks an entry that is trade-to-trade, in the F&O
 ban, under surveillance, in a narrow band, or whose target or stop is past
-today's price band (details in `trader-risk/SKILL.md`).
+today's price band (details in `trader-risk/SKILL.md`). And the backtest:
+`trader-timemachine/backtest.py collect` grows a store of 5-minute bars (Yahoo
+keeps 60 days, so run it every week or two), and `backtest.py run` replays the
+opening-range breakout on every stored stock and session with the same
+sizing, charges and daily limits, then checks Phase 1's gate (a year of
+sessions, 200 trades, positive after charges overall and out of sample,
+drawdown within 6 % of the budget). No real money until it says PASS.
 
 Not done yet (Phase 1): an Indian broker connection (Kite Connect or another
 broker's API on a whitelisted static IP, under SEBI's 2026 retail algo rules),
 real-time data instead of Yahoo, NSE corporate announcements for
 `/trader-news` (Yahoo's headline feed matches `.NS` tickers loosely),
 fundamentals from NSE/BSE filings for `/trader-analyst` (SEC only today), a
-one-year backtest with charges, and the 2027 NSE holidays (NSE publishes them
-in December). `/trader-pelosi` stays US-only.
+year of stored bars for the backtest, and the 2027 NSE holidays (NSE
+publishes them in December). `/trader-pelosi` stays US-only.
 
 > **Looking for the original Trader skill?** Copy an investor's 13F, the
 > stock screener, tax lots and rebalancing live in

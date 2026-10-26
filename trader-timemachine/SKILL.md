@@ -12,7 +12,11 @@ description: >-
   "replay this trade", "what are the odds", "simulate this trade", "monte
   carlo", "backtest this setup", "how often does this hit the target", "is
   this a coin flip", or after /trader-exit writes a plan, before
-  /trader-budget.
+  /trader-budget. On NSE it also backtests the opening-range breakout on
+  every stored stock and session with Indian charges, sizing and daily
+  limits, and checks Phase 1's gate (backtest.py): use when the user says
+  "run the backtest", "backtest the strategy", "is it ready for real money",
+  "check the gate", "collect bars".
 argument-hint: "[path to plan.json, or TICKER]"
 ---
 
@@ -167,6 +171,54 @@ time. The India reel (RELIANCE, 2026-10-19, 55 real sessions, seed 19):
 target first 0.6 %, stop first 17.3 %, neither 82.1 %; history 26 fired, 9
 target, 11 stop; "Strongly toward the stop". The replays do not include
 charges: trader-budget adds them.
+
+## The backtest and Phase 1's gate (NSE)
+
+`backtest.py` answers the question before real money: does the
+opening-range breakout make money on NSE after charges, across many stocks
+and a whole year, with the same rules the other skills enforce?
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/backtest.py" collect          # 60 days of 5-min bars for trader/universe.txt -> trader/bars/
+python3 "${CLAUDE_SKILL_DIR}/backtest.py" run              # every stored session -> the report and the gate
+python3 "${CLAUDE_SKILL_DIR}/backtest.py" run --write --trades   # also trader/backtest.json and a CSV of trades
+```
+
+Yahoo keeps 5-minute bars for 60 days, so `collect` merges each download
+into `trader/bars/<SYMBOL>.json.gz`. Run it every week or two (a scheduled
+task works) and the history grows toward the year the gate wants; a
+broker's history can fill the same files in Phase 1.
+
+`run` takes, each day, every stock's first 5-minute close above its 9:15 to
+9:30 range (entries 9:30 to 14:45), in time order across stocks. It sizes
+each one as trader-budget does (max loss with charges, position cap, max
+order, cash in use), skips what trader-risk would block (reward:risk after
+charges, the day's trades and daily loss), and exits at the stop, the 2R
+target or 15:10. NSE charges and 0.02 % slippage a side are paid on every
+trade. Options: `--stop or-low`, `--target-r 1.5`, `--or-minutes 30`,
+`--from`, `--to`, `--symbols`, `--oos-sessions`.
+
+Tell the user, in this order: the sessions and stocks covered, the all /
+in-sample / out-of-sample lines (trades, win rate, net, gross, charges,
+average a trade, R), the exits, the signals not taken, then every gate line
+as printed. The gate: at least 250 sessions, at least 200 trades, positive
+after charges overall and on the held-out last quarter, and the deepest fall
+within `gate_max_drawdown_pct` (6 %) of the budget. NOT YET on any line means
+no real money; say so plainly, and never round a negative or thin result up.
+
+On RELIANCE alone (59 sessions, `tests/fixtures/trader-india`): 21 trades,
+gross Rs 2,786, charges Rs 2,478, net Rs 308; the last 14 sessions lost; the
+gate is NOT YET.
+
+The first real run, 2026-10-26, on 211 of the 213 F&O stocks (59 sessions,
+2026-07-30 to 2026-10-26, the India config): 177 trades, win rate 37 %, gross
+-Rs 16,487, charges Rs 17,378, net -Rs 33,865 (-0.14 R a trade), profit factor
+0.74, deepest fall Rs 42,939 (8.6 % of the budget). Every gate line was NOT
+YET. A range low stop, a 30-minute range and a 1.5R target (with
+min_reward_risk 1.0) all lost too (-Rs 32,107 to -Rs 51,005). The day's
+trade limit turned away 6,284 later signals: the first three breakouts of
+the morning are the ones taken. Not modelled: past price bands, F&O bans,
+the opening auction, partial fills and news.
 
 ## Safety
 

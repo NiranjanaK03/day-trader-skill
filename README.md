@@ -61,6 +61,10 @@ opening-range breakout on every stored stock and session with the same
 sizing, charges and daily limits, then checks Phase 1's gate (a year of
 sessions, 200 trades, positive after charges overall and out of sample,
 drawdown within 6 % of the budget). No real money until it says PASS.
+The first run, on 211 F&O stocks over 59 sessions, lost Rs 33,865 after Rs
+17,378 of charges, and the research report's filters (the market above its
+VWAP, the opening gap, trigger volume, India VIX), alone or together, did
+not turn it positive (results in `trader-timemachine/SKILL.md`).
 
 Not done yet (Phase 1): an Indian broker connection (Kite Connect or another
 broker's API on a whitelisted static IP, under SEBI's 2026 retail algo rules),

@@ -44,6 +44,20 @@ default); slippage_pct (0.02 % a side by default) is extra. Capital does not
 compound: every day starts from the budget. R = the trade's net result over its
 max loss with charges, so a stop is about -1R.
 
+Filters (the research report's, each off unless asked for):
+  --nifty-vwap       the trigger bar must close with the market above its VWAP
+                     since 9:15. Yahoo's Nifty index has no volume, so the market
+                     is NIFTYBEES (the Nifty 50 ETF), whose bars collect stores
+  --max-gap PCT      skip the stock that day when its 9:15 open is more than
+                     PCT % from the previous session's last 5-minute close
+  --min-volume-x X   the trigger bar's volume must be X times the average of the
+                     opening-range bars that traded (Yahoo's 9:15 bar often shows
+                     zero volume; those are left out of the average). As in
+                     trader-entry, a thin breakout bar does not count and a later
+                     bar can still trigger; so can a later bar for --nifty-vwap
+  --vix-max V        India VIX's close the day before above V: --vix-mode half
+                     (the default) halves the max loss a trade, skip skips the day
+
 Not modelled: the opening auction, partial fills, the price band and the F&O
 ban on past days (NSE does not publish them backwards), and news. A backtest
 of past bars is not a forecast.
@@ -84,6 +98,8 @@ SESSION_BARS = (END_MIN - OPEN_MIN) // 5   # 72
 IST = datetime.timedelta(hours=5, minutes=30)
 EPOCH = datetime.datetime(1970, 1, 1)
 DEFAULT_STORE = "trader/bars"
+MARKET_PROXY = "NIFTYBEES"   # the Nifty 50 ETF: the market's VWAP (the index itself has no volume)
+VIX_FILE = "INDIAVIX.daily.json"   # India VIX daily closes; not a .json.gz, so run never trades it
 DEFAULTS = {  # the India config's values (trader-budget/config.example.json); the config overrides them
     "budget": 500000, "cash_buffer_pct": 10, "max_position_pct": 40, "max_order_usd": 200000,
     "min_order_usd": 1000, "max_loss_per_trade_usd": 2500, "max_daily_loss_usd": 7500,
@@ -107,7 +123,10 @@ COSTS_NSE = {
 }
 SKIP_WORDS = {"rr": "reward:risk after charges under the minimum", "min_stop": "stop under min_stop_pct",
               "zero": "zero shares (the stop is too far for the max loss)", "small": "under min_order_usd",
-              "trades": "the day's trades limit", "daily_loss": "the daily loss limit", "cash": "no cash free"}
+              "trades": "the day's trades limit", "daily_loss": "the daily loss limit", "cash": "no cash free",
+              "filter": "no bar passed the volume or Nifty filter", "gap": "opening gap over --max-gap",
+              "vix": "India VIX over --vix-max", "no_market": "no NIFTYBEES bars that day",
+              "no_prev": "no previous close for the gap"}
 
 
 class BacktestError(Exception):
@@ -190,8 +209,9 @@ def shares_within_loss(max_loss, entry, stop, rates=None):
 # ---------------------------------------------------------------- the bar store
 
 def yahoo_symbol(sym):
+    """RELIANCE -> RELIANCE.NS; an index (^INDIAVIX) stays as it is."""
     sym = sym.upper()
-    return sym if sym.endswith(".NS") else sym + ".NS"
+    return sym if sym.endswith(".NS") or sym.startswith("^") else sym + ".NS"
 
 
 def store_path(store, sym):
@@ -250,14 +270,40 @@ def chart_bars(text, sym):
     return out
 
 
-def fetch_chart(sym, sleep=time.sleep):
-    """One request for 60 days of 5-min bars; query2, then query1 on 429 or 5xx."""
+def vix_closes(text):
+    """A Yahoo daily chart of ^INDIAVIX -> {date: close}, the date in India time."""
+    try:
+        res = json.loads(text)["chart"]["result"][0]
+    except (ValueError, KeyError, TypeError, IndexError):
+        raise BacktestError("Yahoo returned no chart for ^INDIAVIX")
+    closes = (((res.get("indicators") or {}).get("quote") or [{}])[0] or {}).get("close") or []
+    return {ist_of(ts).date().isoformat(): round(c, 2)
+            for ts, c in zip(res.get("timestamp") or [], closes) if ts is not None and c is not None}
+
+
+def load_vix(store):
+    path = os.path.join(store, VIX_FILE)
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh).get("closes") or {}
+
+
+def save_vix(store, closes):
+    os.makedirs(store, exist_ok=True)
+    with open(os.path.join(store, VIX_FILE), "w", encoding="utf-8") as fh:
+        json.dump({"symbol": "^INDIAVIX", "interval": "1d", "source": "yahoo",
+                   "closes": {d: closes[d] for d in sorted(closes)}}, fh, indent=0)
+
+
+def fetch_chart(sym, sleep=time.sleep, rng="60d", interval="5m"):
+    """One request: 60 days of 5-min bars by default; query2, then query1 on 429 or 5xx."""
     last = None
     for n, host in enumerate(HOSTS):
         if n:
             sleep(PAUSE)
-        url = "https://%s.finance.yahoo.com/v8/finance/chart/%s?range=60d&interval=5m" % (
-            host, urllib.parse.quote(yahoo_symbol(sym)))
+        url = "https://%s.finance.yahoo.com/v8/finance/chart/%s?range=%s&interval=%s" % (
+            host, urllib.parse.quote(yahoo_symbol(sym)), rng, interval)
         for attempt in (0, 1):
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
@@ -315,16 +361,36 @@ def sessions(bars):
     return full, sorted(short)
 
 
-def signal(day_bars, rules):
+def with_vwap(day_bars):
+    """The market proxy's bars with "above": close at or above the VWAP since 9:15
+    (typical price (h + l + c) / 3, weighted by volume) at each bar's close."""
+    pv = vol = 0.0
+    out = []
+    for b in day_bars:
+        pv += (b["h"] + b["l"] + b["c"]) / 3.0 * b["v"]
+        vol += b["v"]
+        out.append(dict(b, above=(b["c"] >= pv / vol) if vol else None))
+    return out
+
+
+def signal(day_bars, rules, market=None):
     """The day's opening-range breakout on one stock, or None: the trigger bar,
-    the entry (its close plus slippage), the stop, the target and the risk."""
+    the entry (its close plus slippage), the stop, the target and the risk.
+    With rules["min_volume_x"] or rules["nifty_vwap"] (market = the proxy's bars
+    from with_vwap), a breakout bar that fails them does not count."""
     n_or = rules["or_minutes"] // 5
     rng = day_bars[:n_or]
     oh, ol = max(b["h"] for b in rng), min(b["l"] for b in rng)
+    traded = [b["v"] for b in rng if b["v"]]
+    avg_vol = sum(traded) / float(len(traded)) if traded else None
     for b in day_bars[n_or:]:
         closes_at = b["start"] + 5
         if closes_at > rules["last_entry_min"]:
             return None
+        if rules.get("min_volume_x") and (not avg_vol or b["v"] < rules["min_volume_x"] * avg_vol):
+            continue
+        if rules.get("nifty_vwap") and not (market and market[b["slot"]]["above"]):
+            continue
         if b["c"] > oh and closes_at >= rules["first_entry_min"]:
             entry = paisa(b["c"] * (1 + rules["slip"]))
             stop = paisa_down((oh + ol) / 2.0 if rules["stop"] == "or-mid" else ol)
@@ -351,13 +417,14 @@ def exit_of(day_bars, sig, rules):
     return paisa(last["c"] * (1 - slip)), clock(last["start"] + 5), "flat"
 
 
-def size_trade(sig, cfg, cash_free, rates):
-    """(qty, why_not, charges_at_stop, charges_at_target) as trader-budget sizes it."""
+def size_trade(sig, cfg, cash_free, rates, loss_scale=1.0):
+    """(qty, why_not, charges_at_stop, charges_at_target) as trader-budget sizes it.
+    loss_scale 0.5 halves the max loss a trade (India VIX over --vix-max)."""
     entry, stop, target = sig["entry"], sig["stop"], sig["target"]
     if cfg["min_stop_pct"] and sig["risk"] < entry * float(cfg["min_stop_pct"]) / 100.0 - 1e-9:
         return 0, "min_stop", None, None
     budget = float(cfg["budget"])
-    limits = [shares_within_loss(float(cfg["max_loss_per_trade_usd"]), entry, stop, rates),
+    limits = [shares_within_loss(float(cfg["max_loss_per_trade_usd"]) * loss_scale, entry, stop, rates),
               int(budget * float(cfg["max_position_pct"]) / 100.0 // entry),
               int(float(cfg["max_order_usd"]) // entry), int(max(cash_free, 0) // entry)]
     qty = min(limits)
@@ -373,27 +440,65 @@ def size_trade(sig, cfg, cash_free, rates):
     return qty, None, at_stop, at_target
 
 
-def backtest(stores, cfg, rules, date_from=None, date_to=None):
+def prev_closes(bars):
+    """{date: the previous session's last 5-minute close} from every stored bar."""
+    last = {}
+    for ts in sorted(bars):
+        last[ist_of(ts).date().isoformat()] = bars[ts][3]
+    days = sorted(last)
+    return {d: last[days[i - 1]] for i, d in enumerate(days) if i}
+
+
+def backtest(stores, cfg, rules, date_from=None, date_to=None, market=None, vix=None):
     """Pure function. stores = {SYM: {ts: bar}}. Every day, every stock's signal in
     time order, the day's limits, the sizing and the exit. Returns the trades,
-    the skipped signals, the dates and the sessions each stock had."""
+    the skipped signals, the dates and the sessions each stock had.
+    market = the market proxy's bars (NIFTYBEES), for --nifty-vwap; vix = {date:
+    India VIX close}, for --vix-max (the close of the session before)."""
     rates = cfg.get("costs")
-    days, left_out = {}, {}
+    days, left_out, prev = {}, {}, {}
     for sym, bars in stores.items():
         full, short = sessions(bars)
         left_out[sym] = short
+        if rules.get("max_gap_pct") is not None:
+            prev[sym] = prev_closes(bars)
         for day, day_bars in full.items():
             if (date_from and day < date_from) or (date_to and day > date_to):
                 continue
             days.setdefault(day, {})[sym] = day_bars
+    market_days = {d: with_vwap(b) for d, b in sessions(market)[0].items()} if market else {}
+    vix_days = sorted(vix or {})
     investable = float(cfg["budget"]) * (1 - float(cfg["cash_buffer_pct"]) / 100.0)
     trades, skipped = [], []
     for day in sorted(days):
+        loss_scale = 1.0
+        if rules.get("vix_max") is not None:
+            before = [d for d in vix_days if d < day]
+            if before and vix[before[-1]] > rules["vix_max"]:
+                if rules.get("vix_mode", "half") == "skip":
+                    for sym in days[day]:
+                        skipped.append({"date": day, "symbol": sym, "time": "", "why": "vix"})
+                    continue
+                loss_scale = 0.5
         sigs = []
         for sym, day_bars in days[day].items():
-            s = signal(day_bars, rules)
+            if rules.get("nifty_vwap") and day not in market_days:
+                skipped.append({"date": day, "symbol": sym, "time": "", "why": "no_market"})
+                continue
+            if rules.get("max_gap_pct") is not None:
+                pc = prev[sym].get(day)
+                if not pc:
+                    skipped.append({"date": day, "symbol": sym, "time": "", "why": "no_prev"})
+                    continue
+                if abs(day_bars[0]["o"] / pc - 1) * 100 > rules["max_gap_pct"] + 1e-9:
+                    skipped.append({"date": day, "symbol": sym, "time": "", "why": "gap"})
+                    continue
+            s = signal(day_bars, rules, market_days.get(day))
             if s:
                 sigs.append((s["slot"], sym, s, day_bars))
+            elif (rules.get("min_volume_x") or rules.get("nifty_vwap")) and signal(day_bars, dict(
+                    rules, min_volume_x=None, nifty_vwap=False)):
+                skipped.append({"date": day, "symbol": sym, "time": "", "why": "filter"})
         sigs.sort(key=lambda x: (x[0], x[1]))
         n, at_risk, open_pos = 0, 0.0, []   # open_pos: (exit slot, rupees in use)
         for slot, sym, s, day_bars in sigs:
@@ -401,7 +506,8 @@ def backtest(stores, cfg, rules, date_from=None, date_to=None):
             if n >= int(cfg["max_trades_per_day"]):
                 skipped.append({"date": day, "symbol": sym, "time": s["time"], "why": "trades"})
                 continue
-            qty, why, at_stop, at_target = size_trade(s, cfg, investable - sum(p[1] for p in open_pos), rates)
+            qty, why, at_stop, at_target = size_trade(s, cfg, investable - sum(p[1] for p in open_pos), rates,
+                                                      loss_scale)
             if not qty:
                 skipped.append({"date": day, "symbol": sym, "time": s["time"], "why": why})
                 continue
@@ -491,6 +597,19 @@ def report(res, total, ins, oos, checks, cfg, rules):
                                               dates[-1] if dates else "-", money(float(cfg["budget"])),
                                               money(float(cfg["max_loss_per_trade_usd"])),
                                               int(cfg["max_trades_per_day"]), "%g" % float(cfg["slippage_pct"])))
+    filters = []
+    if rules.get("nifty_vwap"):
+        filters.append("the market (%s) above its VWAP" % MARKET_PROXY)
+    if rules.get("max_gap_pct") is not None:
+        filters.append("opening gap within %g%%" % rules["max_gap_pct"])
+    if rules.get("min_volume_x"):
+        filters.append("trigger volume %gx the range's" % rules["min_volume_x"])
+    if rules.get("vix_max") is not None:
+        vr = res.get("vix_range")
+        filters.append("India VIX over %g the day before: %s%s" % (
+            rules["vix_max"], "half the max loss" if rules.get("vix_mode", "half") == "half" else "no trades",
+            " (VIX ranged %g to %g in this window)" % vr if vr else ""))
+    out.append("Filters: %s." % ("; ".join(filters) if filters else "none"))
     out.append("")
     for name, s in (("All", total), ("In sample", ins), ("Out of sample", oos)):
         if not s["sessions"]:
@@ -575,6 +694,21 @@ def cmd_collect(a):
     print("Stored in %s: %d new bars for %d of %d stocks.%s" % (
         a.store, added_total, len(syms) - len(failed), len(syms),
         (" Failed: " + "; ".join(failed[:10]) + (" ..." if len(failed) > 10 else "")) if failed else ""))
+    if not a.offline and not a.no_context:
+        # the filters' context: the market proxy's 5-minute bars, and a year of India VIX closes
+        try:
+            if MARKET_PROXY not in syms:
+                time.sleep(a.pause)
+                bars = load_bars(a.store, MARKET_PROXY)
+                bars.update(chart_bars(fetch_chart(MARKET_PROXY), MARKET_PROXY))
+                save_bars(a.store, MARKET_PROXY, bars)
+            time.sleep(a.pause)
+            vix = load_vix(a.store)
+            vix.update(vix_closes(fetch_chart("^INDIAVIX", rng="1y", interval="1d")))
+            save_vix(a.store, vix)
+            print("Context: %s 5-minute bars (the market's VWAP) and %d India VIX closes." % (MARKET_PROXY, len(vix)))
+        except BacktestError as e:
+            print("Context not stored (%s): --nifty-vwap and --vix-max need it." % e)
     return 0 if len(failed) < len(syms) else 1
 
 
@@ -584,19 +718,31 @@ def cmd_run(a):
              "slip": float(cfg["slippage_pct"]) / 100.0,
              "first_entry_min": hhmm_min(cfg["no_entries_before"], "no_entries_before"),
              "last_entry_min": hhmm_min(cfg["no_entries_after"], "no_entries_after"),
-             "flat_min": hhmm_min(cfg["flat_by"], "flat_by")}
+             "flat_min": hhmm_min(cfg["flat_by"], "flat_by"), "nifty_vwap": a.nifty_vwap,
+             "max_gap_pct": a.max_gap, "min_volume_x": a.min_volume_x, "vix_max": a.vix_max,
+             "vix_mode": a.vix_mode}
     if a.or_minutes < 5 or a.or_minutes % 5 or a.or_minutes > 120:
         raise BacktestError("--or-minutes wants a multiple of 5 from 5 to 120")
     if not os.path.isdir(a.store):
         raise BacktestError("no bar store at %s: run backtest.py collect first" % a.store)
     names = [f[:-len(".json.gz")] for f in os.listdir(a.store) if f.endswith(".json.gz")]
+    names = [n for n in names if n != MARKET_PROXY]   # the market's yardstick, not a trade
     if a.symbols:
         names = [s for s in re.split(r"[,\s]+", a.symbols.upper()) if s]
     stores = {s: load_bars(a.store, s) for s in sorted(names)}
     stores = {s: b for s, b in stores.items() if b}
     if not stores:
         raise BacktestError("no stored bars in %s for those stocks" % a.store)
-    res = backtest(stores, cfg, rules, a.date_from, a.date_to)
+    market = load_bars(a.store, MARKET_PROXY) if a.nifty_vwap else None
+    if a.nifty_vwap and not market:
+        raise BacktestError("--nifty-vwap needs %s's bars in the store: run backtest.py collect" % MARKET_PROXY)
+    vix = load_vix(a.store) if a.vix_max is not None else None
+    if a.vix_max is not None and not vix:
+        raise BacktestError("--vix-max needs India VIX closes in the store: run backtest.py collect")
+    res = backtest(stores, cfg, rules, a.date_from, a.date_to, market, vix)
+    if vix:
+        window = [v for d, v in vix.items() if res["dates"] and res["dates"][0] <= d <= res["dates"][-1]]
+        res["vix_range"] = (min(window), max(window)) if window else None
     if not res["dates"]:
         raise BacktestError("no full sessions in the store for that window")
     budget = float(cfg["budget"])
@@ -607,6 +753,7 @@ def cmd_run(a):
     oos = stats([t for t in res["trades"] if t["date"] in oos_set], oos_dates, budget)
     checks = gate(total, oos, cfg)
     doc = {"created_by": "trader-timemachine backtest", "rules": dict(rules, slip_pct=float(cfg["slippage_pct"])),
+           "vix_range": res.get("vix_range"),
            "all": total, "in_sample": ins, "out_of_sample": oos,
            "gate": [{"check": n, "pass": ok, "words": w} for n, ok, w in checks],
            "passed": all(ok for _, ok, _ in checks), "trades": res["trades"], "skipped": res["skipped"]}
@@ -645,8 +792,14 @@ def main(argv=None):
     p.add_argument("--offline", metavar="FILE", help="import a saved Yahoo chart JSON (.json or .json.gz)")
     p.add_argument("--pause", type=float, default=PAUSE)
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--no-context", action="store_true", help="skip the NIFTYBEES bars and India VIX closes")
     p.add_argument("--config", default="trader/config.json")
     p = sub.add_parser("run", help="backtest every stored session")
+    p.add_argument("--nifty-vwap", action="store_true", help="the market (NIFTYBEES) above its VWAP at the trigger")
+    p.add_argument("--max-gap", type=float, metavar="PCT", help="skip a stock that opened more than PCT %% away")
+    p.add_argument("--min-volume-x", type=float, metavar="X", help="trigger volume X times the range's average")
+    p.add_argument("--vix-max", type=float, metavar="V", help="India VIX close the day before above V")
+    p.add_argument("--vix-mode", choices=["half", "skip"], default="half", help="over --vix-max: half size or skip")
     p.add_argument("--store", default=DEFAULT_STORE)
     p.add_argument("--symbols", help="only these tickers (default: every stock in the store)")
     p.add_argument("--from", dest="date_from", help="first session, YYYY-MM-DD")

@@ -547,6 +547,68 @@ class Backtest(unittest.TestCase):
         self.assertIn("59 sessions, no trades.", text)
         self.assertIn("a 1.5R target can never reach min_reward_risk 1.5 after charges", text)
 
+    def with_context(self):
+        """The store plus the filters' context: NIFTYBEES's stored bars and India VIX closes (real, 2026-10-26)."""
+        import shutil
+        shutil.copy(os.path.join(IN, "NIFTYBEES-store.json.gz"), bt.store_path(self.store, "NIFTYBEES"))
+        shutil.copy(os.path.join(IN, "INDIAVIX.daily.json"), os.path.join(self.store, bt.VIX_FILE))
+        return bt.load_bars(self.store, "NIFTYBEES"), bt.load_vix(self.store)
+
+    def test_vwap_is_volume_weighted_typical_price(self):
+        bars = [{"h": 11, "l": 9, "c": 10, "v": 100}, {"h": 13, "l": 11, "c": 12, "v": 300},
+                {"h": 12, "l": 10, "c": 10.5, "v": 0}]
+        flags = [b["above"] for b in bt.with_vwap(bars)]
+        self.assertEqual(flags, [True, True, False])   # VWAP 10, then 11.5, then still 11.5
+
+    def test_volume_and_market_filters_only_take_bars_that_pass(self):
+        market, _ = self.with_context()
+        mdays = {d: bt.with_vwap(b) for d, b in bt.sessions(market)[0].items()}
+        full, _ = bt.sessions(self.bars)
+        checked = 0
+        for day, bars in full.items():
+            base = bt.signal(bars, self.rules())
+            vol = bt.signal(bars, self.rules(min_volume_x=1.5))
+            if vol:
+                traded = [b["v"] for b in bars[:3] if b["v"]]
+                self.assertGreaterEqual(bars[vol["slot"]]["v"], 1.5 * sum(traded) / len(traded))
+                self.assertGreaterEqual(vol["slot"], base["slot"])
+                checked += 1
+            if day in mdays:
+                mkt = bt.signal(bars, self.rules(nifty_vwap=True), mdays[day])
+                if mkt:
+                    self.assertTrue(mdays[day][mkt["slot"]]["above"])
+                    self.assertGreaterEqual(mkt["slot"], base["slot"])
+        self.assertGreater(checked, 0)
+
+    def test_gap_uses_the_previous_sessions_last_close(self):
+        prev = bt.prev_closes(self.bars)
+        last_1016 = max(ts for ts in self.bars if bt.ist_of(ts).date().isoformat() == "2026-10-16")
+        self.assertEqual(prev["2026-10-19"], self.bars[last_1016][3])
+        cfg = dict(bt.DEFAULTS, **INDIA_CFG)
+        res = bt.backtest({"RELIANCE": self.bars}, cfg, self.rules(max_gap_pct=0.5))
+        full, _ = bt.sessions(self.bars)
+        gapped = sum(1 for d, b in full.items() if d in prev and abs(b[0]["o"] / prev[d] - 1) * 100 > 0.5)
+        self.assertEqual(sum(1 for s in res["skipped"] if s["why"] == "gap"), gapped)
+        self.assertTrue(all(abs(full[t["date"]][0]["o"] / prev[t["date"]] - 1) * 100 <= 0.5 for t in res["trades"]))
+
+    def test_vix_halves_the_size_or_skips_the_day(self):
+        _, vix = self.with_context()
+        cfg = dict(bt.DEFAULTS, **INDIA_CFG)
+        half = bt.backtest({"RELIANCE": self.bars}, cfg, self.rules(vix_max=0), vix=vix)
+        self.assertTrue(half["trades"])
+        self.assertTrue(all(t["max_loss"] <= 1250 for t in half["trades"]))   # Rs 2,500 halved
+        skip = bt.backtest({"RELIANCE": self.bars}, cfg, self.rules(vix_max=0, vix_mode="skip"), vix=vix)
+        self.assertEqual(skip["trades"], [])
+        self.assertTrue(all(s["why"] == "vix" for s in skip["skipped"]))
+
+    def test_the_filters_are_named_in_the_report(self):
+        self.with_context()
+        code, text = quiet(bt.main, ["run", "--store", self.store, "--config", CFG, "--nifty-vwap", "--max-gap",
+                                     "2", "--min-volume-x", "1.5", "--vix-max", "20"])
+        self.assertIn("Filters: the market (NIFTYBEES) above its VWAP; opening gap within 2%; trigger volume 1.5x "
+                      "the range's; India VIX over 20 the day before: half the max loss (VIX ranged", text)
+        self.assertIn("1 stocks", text)   # NIFTYBEES is the yardstick, never a trade
+
     def test_a_chart_for_another_stock_is_refused(self):
         with gzip.open(SIXTY_DAYS, "rt", encoding="utf-8") as fh:
             text = fh.read()

@@ -220,6 +220,39 @@ trade limit turned away 6,284 later signals: the first three breakouts of
 the morning are the ones taken. Not modelled: past price bands, F&O bans,
 the opening auction, partial fills and news.
 
+### The research report's filters
+
+`run` can add each of the report's filters (off unless asked for):
+
+| flag | what it does |
+| --- | --- |
+| `--nifty-vwap` | the trigger bar must close with the market above its VWAP since 9:15. Yahoo's Nifty index has no volume, so the market is NIFTYBEES (the Nifty 50 ETF); `collect` stores its bars |
+| `--max-gap 2` | skip a stock whose 9:15 open is more than 2 % from the previous session's last 5-minute close |
+| `--min-volume-x 1.5` | the trigger bar needs 1.5 times the average volume of the range bars that traded (Yahoo's 9:15 bar often shows zero) |
+| `--vix-max 20` | India VIX closed above 20 the day before: half the max loss a trade (`--vix-mode skip`: no trades) |
+
+A thin bar, or one with the market under its VWAP, does not count as the
+breakout, and a later bar can still trigger, as in trader-entry. `collect`
+also stores NIFTYBEES and a year of India VIX closes (`--no-context` skips
+them). Say every variant you ran, not only the best one: with 59 sessions,
+picking the best of many is how a backtest fools you.
+
+The filters on the same F&O store, 2026-10-26 (net after charges, 59 sessions):
+
+| run | trades | win rate | net | profit factor | deepest fall | out of sample |
+| --- | --- | --- | --- | --- | --- | --- |
+| no filter | 177 | 37.3 % | -Rs 33,865 | 0.74 | 8.6 % | -Rs 6,174 |
+| `--nifty-vwap` | 168 | 35.1 % | -Rs 42,277 | 0.64 | 9.7 % | -Rs 9,731 |
+| `--max-gap 2` | 174 | 36.2 % | -Rs 36,575 | 0.71 | 8.7 % | -Rs 7,499 |
+| `--min-volume-x 1.5` | 177 | 36.7 % | -Rs 51,605 | 0.65 | 10.9 % | -Rs 4,406 |
+| `--vix-max 20` | 177 | 37.3 % | -Rs 33,865 | 0.74 | 8.6 % | -Rs 6,174 |
+| all four | 165 | 35.2 % | -Rs 52,066 | 0.59 | 11.2 % | -Rs 7,590 |
+
+None turned it positive. India VIX ran 10.4 to 17.2 in the window, so the
+report's VIX rule never applied (halving at 15 instead: -Rs 32,507). The
+three-trades-a-day limit is reached every day (59 x 3 = 177), so the filters
+change which three trades are taken, not how many.
+
 ## Safety
 
 - Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.
